@@ -1,0 +1,60 @@
+---
+name: ci-local-release
+run-name: Release reusable workflows
+
+# Repository-wide release tagging. Every push to main that touches an action
+# publishes three tags at once:
+#
+#   v1.4.2   immutable, points at this commit forever
+#   v1.4     floating, always the newest patch of that minor
+#   v1       floating, always the newest backward-compatible release
+#
+# Consumers normally pin the major and receive fixes automatically. The size of
+# the bump comes from the commit messages: (MAJOR) or (MINOR) in the text,
+# patch otherwise.
+#
+# One version covers the whole repository, the way github/codeql-action does
+# it. A breaking change in one action therefore raises the major for all of
+# them - the accepted trade-off for a single, readable "@v1" on the consumer
+# side.
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - .github/workflows/**
+      - .github/workflows/release.yml
+  workflow_dispatch:
+
+permissions:
+  contents: write # push tags
+
+# Two concurrent runs would race for the same tags.
+concurrency:
+  group: release
+  cancel-in-progress: false
+
+jobs:
+  release:
+    name: Publish release tags
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # tags, and the diff against the previous commit
+
+      # bump_version: the path filter above already decided that something
+      # releasable changed, so no second change detection is needed.
+      - name: Determine next version
+        id: version
+        uses: florian-hild/actions/next-version@v1
+        with:
+          bump_version: "true"
+
+      - name: Publish tags
+        uses: florian-hild/actions/release-tags@v1
+        with:
+          version: ${{ steps.version.outputs.version }}
