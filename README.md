@@ -60,6 +60,45 @@ Container tags carry no `v` so they read naturally in a compose file, git tags
 do. The size of the bump comes from the commit **subjects**: `(MAJOR)`,
 `(MINOR)`, patch otherwise.
 
+## Versioning several things in one repository
+
+A monorepo that releases several images independently must not let every
+commit bump every version. Point `change_path` at the component and turn
+`bump_version` off, and a run where nothing changed there skips the build:
+
+```yaml
+    permissions:
+      contents: write
+      packages: write
+    uses: florian-hild/reusable-workflows/.github/workflows/container-build.yml@v1
+    with:
+      image: ghcr.io/florian-hild/repository/jumphost-ssh
+      tag_prefix: jumphost-ssh/v
+      change_path: services/jumphost_ssh
+      bump_version: false
+```
+
+`schedule` and `workflow_dispatch` events always bump, so periodic rebuilds
+keep releasing patches. Note that `(MAJOR)`/`(MINOR)` markers are read from
+all commits in a push, not only those touching `change_path`.
+
+## Permissions
+
+The calling job must grant what the reusable workflow's build job requests,
+**whether or not the feature behind a permission is used**: a called workflow
+can only restrict the caller's grant, never expand it, and any job requesting
+more than the caller granted fails the whole run at startup with nothing in
+the logs. The build job needs:
+
+```yaml
+    permissions:
+      contents: write # the release-tags step pushes git tags
+      packages: write # push the image
+```
+
+Even with `publish_tags: false` the `contents: write` grant is required,
+because the permission check is static, not per feature.
+
 ## What the build does beyond pushing
 
 - **Smoke test** — starts the pushed image and waits for its `HEALTHCHECK`.
