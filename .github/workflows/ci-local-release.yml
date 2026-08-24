@@ -24,7 +24,7 @@ on:
       - main
     paths:
       - .github/workflows/**
-      - .github/workflows/release.yml
+      - "!.github/workflows/ci-local-*" # local CI, nothing a consumer can call
   workflow_dispatch:
 
 permissions:

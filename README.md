@@ -85,8 +85,6 @@ Trivy over the working tree, or over an image that was just built:
     uses: florian-hild/reusable-workflows/.github/workflows/security-scan.yml@v1
     with:
       trivy_scan_type: fs
-      trivy_scan_severity: HIGH,CRITICAL
-      trivy_ignore_unfixed: true
 ```
 
 - **The report is always published** — into the job summary, as a run artifact
@@ -100,6 +98,13 @@ Trivy over the working tree, or over an image that was just built:
   Pull requests from forks get a read-only token, so the comment is skipped
   there.
 - **Non-public images** need `registry_login: true` plus a `registry_token`.
+- **Think before narrowing `trivy_scan_severity`.** `HIGH,CRITICAL` is the
+  reflex for keeping a dependency tree's LOW and MEDIUM CVEs from blocking
+  every merge, and for that it is right. It also drops 61 of trivy's 106
+  secret rules, among them `grafana-api-token`, `hashicorp-tf-api-token` and
+  `slack-web-hook`. On a repository without dependencies the filter therefore
+  costs findings and saves no noise. Narrow it when the noise is real, and
+  pair it with `trivy_ignore_unfixed: true` rather than reaching for it first.
 
 ## Versioning
 

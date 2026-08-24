@@ -1,0 +1,28 @@
+---
+name: ci-local-security-scan
+run-name: Security scan
+
+# Scans this repository with the security-scan workflow from the same commit,
+# so a change to it is exercised on the pull request that makes it.
+
+on:
+  pull_request:
+    types: [opened, reopened, ready_for_review, synchronize, labeled]
+  schedule:
+    - cron: "0 6 * * 1" # new findings appear without the code changing
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: security-scan-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  trivy:
+    name: Trivy
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: ./.github/workflows/security-scan.yml
