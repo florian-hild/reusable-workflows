@@ -86,6 +86,23 @@ on:
         required: false
         type: string
         default: "${{ github.actor }}"
+      change_path:
+        description: >-
+          Path that must contain changes for a release. Used by repositories
+          that version several things independently: without it, every commit
+          in the repository bumps the version.
+        required: false
+        type: string
+        default: "."
+      bump_version:
+        description: >-
+          Bump the version even when change_path has no changes. With it off,
+          a run where nothing changed in change_path skips the build instead
+          of releasing. schedule and workflow_dispatch events always bump, so
+          periodic rebuilds keep working.
+        required: false
+        type: boolean
+        default: true
     secrets:
       registry_token:
         description: "Token with write access to the registry."
@@ -128,9 +145,22 @@ jobs:
         uses: florian-hild/actions/next-version@v1
         with:
           tag_pattern: ${{ inputs.tag_prefix }}
-          bump_version: "true"
+          change_path: ${{ inputs.change_path }}
+          bump_version: ${{ inputs.bump_version }}
+
+      # Everything below is skipped when nothing changed in change_path and
+      # bump_version is off: there is nothing to build, tag or publish.
+      - name: Report skipped build
+        if: ${{ steps.get-version.outputs.version == '' }}
+        run: |
+          {
+            echo "### Skipped - nothing to build"
+            echo ""
+            echo "No changes in \`${{ inputs.change_path }}\` since the last release."
+          } >> "$GITHUB_STEP_SUMMARY"
 
       - name: Log in to ${{ inputs.registry }}
+        if: ${{ steps.get-version.outputs.version != '' }}
         uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ inputs.registry }}
@@ -138,10 +168,12 @@ jobs:
           password: ${{ secrets.registry_token }}
 
       - name: Set up Buildx
+        if: ${{ steps.get-version.outputs.version != '' }}
         uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
 
       - name: Generate image tags
         id: tags
+        if: ${{ steps.get-version.outputs.version != '' }}
         shell: bash
         env:
           IMAGE: ${{ inputs.image }}
@@ -180,6 +212,7 @@ jobs:
 
       - name: Build and push
         id: push
+        if: ${{ steps.get-version.outputs.version != '' }}
         uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: ${{ inputs.working_directory }}
@@ -209,7 +242,7 @@ jobs:
       # Catches an image that builds but does not start: a missing dependency,
       # a broken entrypoint, a config the app cannot read.
       - name: Smoke test the image
-        if: inputs.smoke_test && inputs.publish_container
+        if: ${{ steps.get-version.outputs.version != '' && inputs.smoke_test && inputs.publish_container }}
         env:
           IMAGE: ${{ steps.tags.outputs.primary_tag }}
           SMOKE_ENV: ${{ inputs.smoke_test_env }}
@@ -253,13 +286,14 @@ jobs:
 
       # Last, so a failed build or smoke test leaves no version tagged.
       - name: Publish git tags
-        if: inputs.publish_tags
+        if: ${{ steps.get-version.outputs.version != '' && inputs.publish_tags }}
         uses: florian-hild/actions/release-tags@v1
         with:
           version: ${{ steps.get-version.outputs.version }}
           tag_prefix: ${{ inputs.tag_prefix }}
 
       - name: Summary
+        if: ${{ steps.get-version.outputs.version != '' }}
         env:
           IMAGE: ${{ steps.tags.outputs.primary_tag }}
           VERSION: ${{ steps.get-version.outputs.version }}
