@@ -1,0 +1,276 @@
+---
+name: Container build
+run-name: Container build and publish
+
+# Build, publish and tag a container image.
+
+on:
+  workflow_call:
+    inputs:
+      image:
+        description: >-
+          Full image path without a tag,
+          e.g. ghcr.io/florian-hild/repository/image_name
+        required: true
+        type: string
+      working_directory:
+        description: "Build context, the directory holding the container definition."
+        required: false
+        type: string
+        default: "."
+      containerfile:
+        description: "Container definition, relative to working_directory."
+        required: false
+        type: string
+        default: "Containerfile"
+      platforms:
+        description: "Target platforms passed to buildx."
+        required: false
+        type: string
+        default: "linux/amd64,linux/arm64"
+      registry:
+        description: "Container registry to log in to."
+        required: false
+        type: string
+        default: "ghcr.io"
+      build_args:
+        description: >-
+          Additional build arguments, one KEY=value per line. APP_VERSION is
+          always passed and does not need to be listed.
+        required: false
+        type: string
+        default: ""
+      smoke_test:
+        description: >-
+          Start the built image and wait for its HEALTHCHECK. Requires the
+          image to define one; without it the step cannot tell working from
+          broken and warns instead of passing silently. Skipped when
+          publish_container is off, since there is no image to pull.
+        required: false
+        type: boolean
+        default: true
+      smoke_test_env:
+        description: >-
+          Environment for the smoke test, one KEY=value per line. For the
+          minimum an app needs to boot, never for real credentials.
+        required: false
+        type: string
+        default: ""
+      smoke_test_timeout:
+        description: "Seconds to wait for the container to become healthy."
+        required: false
+        type: number
+        default: 60
+      tag_prefix:
+        description: "Prefix for the git tags. Container tags never carry it."
+        required: false
+        type: string
+        default: "v"
+      image_tag:
+        description: "Override the generated container image tag. Example: test or pr123. Empty means use the default release/PR tags."
+        required: false
+        type: string
+        default: ""
+      publish_tags:
+        description: "Publish git tags. Turn off to build and push the image only."
+        required: false
+        type: boolean
+        default: false
+      publish_container:
+        description: "Publish the container image. Turn off to build but not push the image."
+        required: false
+        type: boolean
+        default: false
+      registry_username:
+        description: "Username for the registry. Defaults to the GitHub actor."
+        required: false
+        type: string
+        default: "${{ github.actor }}"
+    secrets:
+      registry_token:
+        description: "Token with write access to the registry."
+        required: true
+    outputs:
+      version:
+        description: "The released version, e.g. 1.4.2"
+        value: ${{ jobs.build.outputs.version }}
+      digest:
+        description: "Digest of the pushed image."
+        value: ${{ jobs.build.outputs.digest }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Build and publish
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write # release-tags pushes git tags
+      packages: write # push the image
+    # Never cancelled: an interrupted run can leave an image pushed without its
+    # git tags, and two runs would race for the same version.
+    concurrency:
+      group: ${{ github.workflow }}-container-build-${{ inputs.image }}
+      cancel-in-progress: false
+    outputs:
+      version: ${{ steps.get-version.outputs.version }}
+      digest: ${{ steps.push.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0 # next-version needs tags and history
+
+      - name: Determine next version
+        id: get-version
+        uses: florian-hild/actions/next-version@v1
+        with:
+          tag_pattern: ${{ inputs.tag_prefix }}
+          bump_version: "true"
+
+      - name: Log in to ${{ inputs.registry }}
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ inputs.registry_username }}
+          password: ${{ secrets.registry_token }}
+
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@37fe631027851001ddb9b187196cc803df7f5f0e # v4.3.0
+
+      - name: Generate image tags
+        id: tags
+        shell: bash
+        env:
+          IMAGE: ${{ inputs.image }}
+          VERSION: ${{ steps.get-version.outputs.version }}
+          MAJOR: ${{ steps.get-version.outputs.major }}
+          MINOR: ${{ steps.get-version.outputs.minor }}
+          IMAGE_TAG_OVERRIDE: ${{ inputs.image_tag }}
+          CONTAINERFILE: ${{ inputs.containerfile }}
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+
+          if [[ -n "${IMAGE_TAG_OVERRIDE}" ]]; then
+            echo "${IMAGE}:${IMAGE_TAG_OVERRIDE}" > /tmp/image-tags.txt
+          elif [[ "${GITHUB_REF}" == "refs/heads/main" ]]; then
+            {
+              echo "${IMAGE}:latest"
+              echo "${IMAGE}:${VERSION}"
+              echo "${IMAGE}:${MAJOR}"
+              echo "${IMAGE}:${MAJOR}.${MINOR}"
+            } > /tmp/image-tags.txt
+          elif [[ "${GITHUB_EVENT_NAME}" == "pull_request" ]]; then
+            echo "${IMAGE}:pr${{ github.event.number }}" > /tmp/image-tags.txt
+          else
+            echo "${IMAGE}:latest" > /tmp/image-tags.txt
+          fi
+
+          {
+            printf 'created=%s\n' "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+            printf 'containerfile=%s\n' "${WORKING_DIRECTORY%/}/${CONTAINERFILE}"
+            printf 'primary_tag=%s\n' "$(head -n 1 /tmp/image-tags.txt)"
+            printf 'tags<<EOF\n'
+            cat /tmp/image-tags.txt
+            printf '\nEOF\n'
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Build and push
+        id: push
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
+        with:
+          context: ${{ inputs.working_directory }}
+          file: ${{ steps.tags.outputs.containerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: ${{ inputs.publish_container }}
+          build-args: |
+            APP_VERSION=${{ steps.get-version.outputs.version }}
+            ${{ inputs.build_args }}
+          tags: ${{ steps.tags.outputs.tags }}
+          labels: |
+            org.opencontainers.image.build_host=github-runner-${{ github.run_number }}
+            org.opencontainers.image.created=${{ steps.tags.outputs.created }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.version=${{ steps.get-version.outputs.version }}
+          # Attestations make the image auditable: what went in, and who built it.
+          sbom: true
+          provenance: mode=max
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+        env:
+          BUILDKIT_PROGRESS: plain
+          DOCKER_BUILD_RECORD_UPLOAD: false
+          DOCKER_BUILDKIT: 1
+
+      # Catches an image that builds but does not start: a missing dependency,
+      # a broken entrypoint, a config the app cannot read.
+      - name: Smoke test the image
+        if: inputs.smoke_test && inputs.publish_container
+        env:
+          IMAGE: ${{ steps.tags.outputs.primary_tag }}
+          SMOKE_ENV: ${{ inputs.smoke_test_env }}
+          TIMEOUT: ${{ inputs.smoke_test_timeout }}
+        run: |
+          set -euo pipefail
+
+          docker pull -q "$IMAGE"
+
+          if [ -z "$(docker image inspect "$IMAGE" \
+              --format '{{if .Config.Healthcheck}}yes{{end}}')" ]; then
+            echo "::warning::image defines no HEALTHCHECK - nothing to verify"
+            exit 0
+          fi
+
+          printf '%s\n' "$SMOKE_ENV" > /tmp/smoke.env
+          cid="$(docker run --rm --init --detach --env-file /tmp/smoke.env "$IMAGE")"
+          trap 'docker stop "$cid" >/dev/null 2>&1 || true' EXIT
+
+          deadline=$(( $(date +%s) + TIMEOUT ))
+          while true; do
+            status="$(docker inspect --format '{{.State.Health.Status}}' "$cid")"
+            case "$status" in
+              healthy)
+                echo "Container reported healthy."
+                exit 0
+                ;;
+              unhealthy)
+                echo "::error::container reported unhealthy"
+                docker logs "$cid"
+                exit 1
+                ;;
+            esac
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::container did not become healthy within ${TIMEOUT}s (last status: ${status})"
+              docker logs "$cid"
+              exit 1
+            fi
+            sleep 2
+          done
+
+      # Last, so a failed build or smoke test leaves no version tagged.
+      - name: Publish git tags
+        if: inputs.publish_tags
+        uses: florian-hild/actions/release-tags@v1
+        with:
+          version: ${{ steps.get-version.outputs.version }}
+          tag_prefix: ${{ inputs.tag_prefix }}
+
+      - name: Summary
+        env:
+          IMAGE: ${{ steps.tags.outputs.primary_tag }}
+          VERSION: ${{ steps.get-version.outputs.version }}
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          {
+            echo "### Released ${VERSION}"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Image | \`${IMAGE}\` |"
+            echo "| Digest | \`${DIGEST}\` |"
+          } >> "$GITHUB_STEP_SUMMARY"
+...

@@ -1,31 +1,119 @@
-# Reusable GitHub Workflows
+# reusable-workflows
 
-No workflow has been added yet.
+Reusable GitHub Actions workflows.
 
-## Usage
+| Workflow | Purpose |
+|---|---|
+| [`python-lint.yml`](.github/workflows/python-lint.yml) | Ruff over a uv-managed project |
+| [`python-test.yml`](.github/workflows/python-test.yml) | pytest, plus a check that `uv.lock` is current |
+| [`container-build.yml`](.github/workflows/container-build.yml) | Build, push and tag a container image |
+| [`security-scan.yml`](.github/workflows/security-scan.yml) | Trivy scan of a filesystem, repository or image |
+
+Workflows prefixed `ci-local-` run on this repository itself and are not meant
+to be called.
+
+## Building a Python container app
+
+Lint and tests gate the build, so a broken commit never reaches the registry:
 
 ```yaml
+name: build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
 jobs:
+  lint:
+    uses: florian-hild/reusable-workflows/.github/workflows/python-lint.yml@v1
+
+  test:
+    uses: florian-hild/reusable-workflows/.github/workflows/python-test.yml@v1
+
   build:
-    uses: florian-hild/reusable-workflows/.github/workflows/<name>.yml@v1
+    needs: [lint, test]
+    if: github.ref == 'refs/heads/main'
+    permissions:
+      contents: write # release-tags pushes git tags
+      packages: write # push the image
+    uses: florian-hild/reusable-workflows/.github/workflows/container-build.yml@v1
     with:
-      example: value
+      image: ghcr.io/florian-hild/repository/kinderuni-anmeldung
+      publish_container: true
+      publish_tags: true
+      smoke_test_env: |
+        TZ=Europe/Berlin
+        ALLOW_INSECURE_DEV_SECRET=true
+    secrets:
+      registry_token: ${{ secrets.REPO_PAT_TOKEN }}
 ```
+
+On `main` this publishes container tags and git tags together:
+
+```
+image:1.4.2   image:1.4   image:1   image:latest
+v1.4.2        v1.4        v1
+```
+
+Container tags carry no `v` so they read naturally in a compose file, git tags
+do. The size of the bump comes from the commit **subjects**: `(MAJOR)`,
+`(MINOR)`, patch otherwise.
+
+## What the build does beyond pushing
+
+- **Smoke test** — starts the pushed image and waits for its `HEALTHCHECK`.
+  Catches an image that builds but does not start. Without a `HEALTHCHECK` in
+  the image the step warns rather than passing silently.
+- **Attestations** — SBOM and provenance are attached, so it stays auditable
+  what went into an image and who built it.
+- **Tags last** — git tags are published only after the build and smoke test
+  pass, so a failed run leaves no version claimed.
+- **Publishing is opt-in** — `publish_container` and `publish_tags` default to
+  off, so a pull request build stays a build. The smoke test pulls the pushed
+  image, so it is skipped while `publish_container` is off.
+
+## Security scanning
+
+Trivy over the working tree, or over an image that was just built:
+
+```yaml
+  scan:
+    permissions:
+      contents: read
+      pull-requests: write
+    uses: florian-hild/reusable-workflows/.github/workflows/security-scan.yml@v1
+    with:
+      trivy_scan_type: fs
+      trivy_scan_severity: HIGH,CRITICAL
+      trivy_ignore_unfixed: true
+```
+
+- **The report is always published** — into the job summary, as a run artifact
+  and, on a pull request, as a single comment that is updated in place instead
+  of one per push.
+- **Findings fail the job by default.** Set `trivy_scan_exit_code: 0` to report
+  without gating, for instance while adopting the scan on an existing project.
+  A scan that fails for any other reason still fails the job.
+- **`pull-requests: write` is only needed for the comment.** It lives in its
+  own job, so with `comment_on_pr` off the scan runs on `contents: read` alone.
+  Pull requests from forks get a read-only token, so the comment is skipped
+  there.
+- **Non-public images** need `registry_login: true` plus a `registry_token`.
 
 ## Versioning
 
 One version covers the whole repository. Every push to `main` that touches
-`.github/workflows/` publishes three tags:
+`.github/workflows/` publishes `v1.4.2`, `v1.4` and `v1`. Pin the major:
 
-| Tag | Moves | Use it for |
-|---|---|---|
-| `v1.4.2` | never | exact reproducibility |
-| `v1.4` | with every patch | fixes only |
-| `v1` | with every compatible release | the normal choice |
+```yaml
+uses: florian-hild/reusable-workflows/.github/workflows/python-test.yml@v1
+```
 
-The size of the bump comes from the commit **subject** lines: `(MAJOR)`,
-`(MINOR)`, or patch when neither appears.
+Tagging is done by [`florian-hild/actions`](https://github.com/florian-hild/actions).
 
-Tagging is done by
-[`florian-hild/actions`](https://github.com/florian-hild/actions), see
-[`release.yml`](.github/workflows/release.yml).
+## Adding a workflow
+
+Add it under `.github/workflows/` with `on: workflow_call`, document its inputs
+in the file, and list it in the table above. The next push to `main` releases
+it.

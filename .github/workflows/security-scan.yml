@@ -1,0 +1,339 @@
+---
+name: Security scan
+run-name: Security scan
+
+on:
+  workflow_call:
+    inputs:
+      scan_target:
+        description: "Scan target. For 'fs' the path to scan, for 'image' the image name, for 'repo' the repository URL."
+        required: false
+        type: string
+        default: "."
+      trivy:
+        description: "Run trivy scan."
+        required: false
+        type: boolean
+        default: true
+      trivy_ignorefile:
+        description: "Path to a .trivyignore or .trivyignore.yaml file. Empty means trivy picks up .trivyignore from the scan directory if there is one."
+        required: false
+        type: string
+        default: ""
+      trivy_ignore_unfixed:
+        description: "Report only vulnerabilities that have a fix available."
+        required: false
+        type: boolean
+        default: false
+      trivy_scan_exit_code:
+        description: "Exit code trivy returns when it finds something. 0 reports without failing the job, 1 fails it."
+        required: false
+        type: number
+        default: 1
+      trivy_scan_format:
+        description: "Trivy scan output format. One of 'table', 'json', 'template'."
+        required: false
+        type: string
+        default: "table"
+      trivy_scan_severity:
+        description: "Trivy scan severity levels to report. Comma-separated list of 'CRITICAL', 'HIGH', 'MEDIUM', 'LOW', 'UNKNOWN'."
+        required: false
+        type: string
+        default: "UNKNOWN,LOW,MEDIUM,HIGH,CRITICAL"
+      trivy_scan_template:
+        description: "Trivy scan template file. Required when trivy_scan_format is 'template'."
+        required: false
+        type: string
+        default: ""
+      trivy_scan_timeout:
+        description: "Timeout for the trivy run itself, e.g. 10m. Empty uses the trivy default of 5m."
+        required: false
+        type: string
+        default: "10m"
+      trivy_scan_type:
+        description: "Trivy scan type. One of 'fs', 'image', 'repo'."
+        required: false
+        type: string
+        default: "fs"
+      trivy_scanners:
+        description: "Trivy scan scanners to use. Comma-separated list of 'vuln', 'config', 'secret'."
+        required: false
+        type: string
+        default: "vuln,config,secret"
+      comment_on_pr:
+        description: "Post the report as a pull request comment. Requires pull-requests: write and is skipped for pull requests from forks."
+        required: false
+        type: boolean
+        default: true
+      registry_login:
+        description: "Log in to a registry before the scan. Needed to scan images that are not public."
+        required: false
+        type: boolean
+        default: false
+      registry:
+        description: "Container registry to log in to."
+        required: false
+        type: string
+        default: "ghcr.io"
+      registry_username:
+        description: "Username for the registry. Defaults to the GitHub actor."
+        required: false
+        type: string
+        default: "${{ github.actor }}"
+    secrets:
+      registry_token:
+        description: "Token with read access to the registry. Only used when registry_login is on."
+        required: false
+
+permissions:
+  contents: read
+
+jobs:
+  trivy:
+    name: Trivy scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: inputs.trivy
+    permissions:
+      contents: read
+    concurrency:
+      group: ${{ github.workflow }}-security-scan-${{ github.ref }}-${{ inputs.trivy_scan_type }}-${{ inputs.scan_target }}
+      cancel-in-progress: true
+    outputs:
+      outcome: ${{ steps.trivy.outcome }}
+      report: ${{ steps.setup.outputs.report }}
+      slug: ${{ steps.setup.outputs.slug }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Both of these make trivy abort with an unhelpful message, so check first.
+      - name: Validate inputs
+        id: setup
+        shell: bash
+        env:
+          FORMAT: ${{ inputs.trivy_scan_format }}
+          IGNOREFILE: ${{ inputs.trivy_ignorefile }}
+          SCAN_TYPE: ${{ inputs.trivy_scan_type }}
+          TARGET: ${{ inputs.scan_target }}
+          TEMPLATE: ${{ inputs.trivy_scan_template }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${FORMAT}" == "template" && -z "${TEMPLATE}" ]]; then
+            echo "::error::trivy_scan_format is 'template' but trivy_scan_template is empty"
+            exit 1
+          fi
+
+          if [[ -n "${IGNOREFILE}" && ! -f "${IGNOREFILE}" ]]; then
+            echo "::error::trivy_ignorefile '${IGNOREFILE}' does not exist"
+            exit 1
+          fi
+
+          case "${FORMAT}" in
+            json) extension="json" ;;
+            sarif) extension="sarif" ;;
+            *) extension="txt" ;;
+          esac
+
+          slug="$(printf '%s' "${SCAN_TYPE}-${TARGET}" | tr -c 'A-Za-z0-9._-' '-' | cut -c1-80)"
+
+          {
+            echo "report=trivy-results.${extension}"
+            echo "slug=${slug}"
+          } >> "${GITHUB_OUTPUT}"
+
+      - name: Log in to ${{ inputs.registry }}
+        if: inputs.registry_login
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ${{ inputs.registry }}
+          username: ${{ inputs.registry_username }}
+          password: ${{ secrets.registry_token }}
+
+      # Never fails the job directly: the report is published first, the gate step decides.
+      - name: Run Trivy scan
+        id: trivy
+        continue-on-error: true
+        uses: aquasecurity/trivy-action@ed142fd0673e97e23eac54620cfb913e5ce36c25 # v0.36.0
+        with:
+          scan-type: ${{ inputs.trivy_scan_type }}
+          scan-ref: ${{ inputs.scan_target }}
+          format: ${{ inputs.trivy_scan_format }}
+          template: ${{ inputs.trivy_scan_template }}
+          trivyignores: ${{ inputs.trivy_ignorefile }}
+          ignore-unfixed: ${{ inputs.trivy_ignore_unfixed }}
+          exit-code: ${{ inputs.trivy_scan_exit_code }}
+          severity: ${{ inputs.trivy_scan_severity }}
+          scanners: ${{ inputs.trivy_scanners }}
+          timeout: ${{ inputs.trivy_scan_timeout }}
+          hide-progress: true
+          output: ${{ steps.setup.outputs.report }}
+
+      # Trivy writes to the report file instead of stdout, so without this the
+      # log of a failed scan is empty.
+      - name: Publish results
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.trivy.outcome }}
+          REPORT: ${{ steps.setup.outputs.report }}
+          SCAN_TYPE: ${{ inputs.trivy_scan_type }}
+          TARGET: ${{ inputs.scan_target }}
+        run: |
+          set -euo pipefail
+
+          {
+            echo "### Trivy ${SCAN_TYPE} scan of \`${TARGET}\`"
+            echo ""
+            echo "Scan outcome: **${OUTCOME}**"
+            echo ""
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          if [[ ! -s "${REPORT}" ]]; then
+            echo "No report was written." >> "${GITHUB_STEP_SUMMARY}"
+            exit 0
+          fi
+
+          cat "${REPORT}"
+
+          {
+            echo "<details><summary>Report</summary>"
+            echo ""
+            echo '```'
+            head -c 200000 "${REPORT}"
+            echo ""
+            echo '```'
+            echo ""
+            echo "</details>"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload the report
+        if: ${{ !cancelled() && steps.setup.outputs.report != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: trivy-${{ steps.setup.outputs.slug }}
+          path: ${{ steps.setup.outputs.report }}
+          if-no-files-found: ignore
+          retention-days: 15
+
+      - name: Fail on findings
+        id: gate
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          EXIT_CODE: ${{ inputs.trivy_scan_exit_code }}
+          OUTCOME: ${{ steps.trivy.outcome }}
+        run: |
+          set -euo pipefail
+
+          if [[ "${OUTCOME}" == "success" ]]; then
+            echo "exit_code=0" >> "${GITHUB_OUTPUT}"
+            exit 0
+          fi
+
+          # A non-zero exit with trivy_scan_exit_code 0 is a broken scan, not a finding.
+          if [[ "${EXIT_CODE}" == "0" ]]; then
+            echo "exit_code=2" >> "${GITHUB_OUTPUT}"
+            echo "::error::Trivy did not complete successfully"
+            exit 2
+          fi
+
+          echo "exit_code=${EXIT_CODE}" >> "${GITHUB_OUTPUT}"
+          echo "::error::Trivy reported findings, see the job summary"
+          exit "${EXIT_CODE}"
+
+  # Own job, so pull-requests: write is only requested when a comment is wanted.
+  # Forked pull requests get a read-only token, so there is nothing to post to.
+  comment:
+    name: Comment on the pull request
+    needs: trivy
+    if: >-
+      !cancelled() && inputs.comment_on_pr
+      && needs.trivy.result != 'skipped'
+      && github.event_name == 'pull_request'
+      && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Download the report
+        continue-on-error: true
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: trivy-${{ needs.trivy.outputs.slug }}
+
+      - name: Post Trivy scan results as a comment in the pull request
+        continue-on-error: true
+        uses: actions/github-script@3a2844b7e9c422d3c10d287c895573f7108da1b3 # v9.0.0
+        env:
+          OUTCOME: ${{ needs.trivy.outputs.outcome }}
+          REPORT: ${{ needs.trivy.outputs.report }}
+          SCAN_TYPE: ${{ inputs.trivy_scan_type }}
+          TARGET: ${{ inputs.scan_target }}
+        with:
+          script: |
+            const fs = require('fs');
+            const { OUTCOME, REPORT, SCAN_TYPE, TARGET } = process.env;
+
+            const marker = `<!-- trivy-scan:${SCAN_TYPE}:${TARGET} -->`;
+            const runUrl = `${context.serverUrl}/${context.repo.owner}/${context.repo.repo}/actions/runs/${context.runId}`;
+
+            let report = '';
+            try {
+              report = fs.readFileSync(REPORT, 'utf8');
+            } catch {
+              report = '';
+            }
+
+            const limit = 55000;
+            const truncated = report.length > limit;
+            if (truncated) {
+              report = report.slice(0, limit);
+            }
+
+            const status = OUTCOME === 'success'
+              ? 'No findings above the configured severity.'
+              : `Scan outcome: **${OUTCOME}**`;
+
+            const details = report
+              ? [
+                  '<details><summary>Report</summary>',
+                  '',
+                  '```',
+                  report,
+                  '```',
+                  truncated ? '\n_Truncated. The full report is attached to the run as an artifact._' : '',
+                  '',
+                  '</details>',
+                ].join('\n')
+              : '_No report was written._';
+
+            const body = [
+              marker,
+              `### Trivy ${SCAN_TYPE} scan of \`${TARGET}\``,
+              '',
+              status,
+              '',
+              details,
+              '',
+              `[Run details](${runUrl})`,
+            ].join('\n');
+
+            // Update in place so a pull request keeps one comment per scan target.
+            const comments = await github.paginate(github.rest.issues.listComments, {
+              ...context.repo,
+              issue_number: context.issue.number,
+              per_page: 100,
+            });
+            const existing = comments.find((comment) => comment.body?.includes(marker));
+
+            if (existing) {
+              await github.rest.issues.updateComment({ ...context.repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ ...context.repo, issue_number: context.issue.number, body });
+            }
+...

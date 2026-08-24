@@ -1,0 +1,62 @@
+---
+name: Python lint
+run-name: Python lint
+
+# Ruff over a uv-managed project. Lint and format are separate switches so a
+# project can adopt the linter without reformatting its whole tree first.
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        description: "Directory containing pyproject.toml and uv.lock."
+        required: false
+        type: string
+        default: "."
+      paths:
+        description: "Paths passed to ruff, relative to working_directory."
+        required: false
+        type: string
+        default: "."
+      check_format:
+        description: "Also run `ruff format --check`."
+        required: false
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+jobs:
+  ruff:
+    name: ruff
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ${{ github.workflow }}-python-lint-${{ inputs.working_directory }}-${{ github.ref }}
+      cancel-in-progress: true
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@20cfd1bf945f4377ade1205e4dbc17946fc9a30d # v10.0.1
+        with:
+          enable-cache: true
+          cache-dependency-glob: ${{ inputs.working_directory }}/uv.lock
+
+      - name: Install dependencies
+        run: uv sync --locked
+
+      # --output-format github turns findings into inline annotations on the
+      # pull request instead of a wall of log output.
+      - name: Run ruff check
+        run: uv run ruff check --output-format github ${{ inputs.paths }}
+
+      - name: Run ruff format --check
+        if: inputs.check_format
+        run: uv run ruff format --check ${{ inputs.paths }}
+...
