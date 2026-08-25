@@ -1,0 +1,521 @@
+---
+name: Container deploy
+
+# Deploy a compose project onto a self-hosted runner, GitOps style: the host
+# keeps a clone of this repository, and every run checks that clone out at the
+# exact commit that triggered the run, so the running containers are always a
+# known commit and never "whatever main happened to be".
+#
+# The job is deliberately token-less - it needs no GITHUB_TOKEN, because the
+# host pulls the repository over its own SSH key.
+
+on:
+  workflow_call:
+    inputs:
+      # --- what to deploy, and where -------------------------------------
+      compose_path:
+        description: >-
+          Directory holding the compose file, relative to the repository root,
+          e.g. home/prd/traefik. Its name becomes the compose project name.
+        required: true
+        type: string
+      runner_label:
+        description: >-
+          Label of the self-hosted runner to deploy on, e.g. docker-prod. It is
+          combined with the self-hosted label.
+        required: true
+        type: string
+      deploy_user:
+        description: >-
+          Host user that owns the clone and talks to the container engine.
+          Every command runs through `sudo -u <deploy_user>`.
+        required: false
+        type: string
+        default: "root"
+      host_repo_path:
+        description: >-
+          Absolute path of the repository clone on the host. Empty means
+          /data/<repository name>. Created by cloning on the first run.
+        required: false
+        type: string
+        default: ""
+      local_changes:
+        description: >-
+          What to do when the host clone has uncommitted changes to tracked
+          files. stash keeps them, recoverable with `git stash list` on the
+          host; discard overwrites them; fail refuses to deploy over them.
+          Never blocks the deploy unless you ask it to.
+        required: false
+        type: string
+        default: "stash"
+      environment:
+        description: >-
+          GitHub Environment to deploy through, e.g. production. Gives the
+          deploy an approval gate, environment secrets and a deployment history.
+          Empty means no environment.
+        required: false
+        type: string
+        default: ""
+
+      # --- how to deploy -------------------------------------------------
+      compose_command:
+        description: >-
+          Compose entrypoint on the host. One of: docker-compose,
+          docker compose, podman-compose, podman compose.
+        required: false
+        type: string
+        default: "docker compose"
+      compose_files:
+        description: >-
+          Compose files to use, one path per line, relative to compose_path.
+          For a base plus an environment overlay. Empty means let compose
+          discover docker-compose.yml itself.
+        required: false
+        type: string
+        default: ""
+      pull_images:
+        description: >-
+          Pull images before deploying. Needed for a floating tag such as
+          latest, where the tag in the compose file did not change but the
+          image behind it did. Pinned tags do not need it - compose pulls a
+          missing image on its own.
+        required: false
+        type: boolean
+        default: false
+      build_images:
+        description: >-
+          Pass --build, rebuilding images that the compose file builds from
+          source. Only for projects with a build: section; without it the flag
+          does nothing.
+        required: false
+        type: boolean
+        default: false
+      force_recreate:
+        description: >-
+          Pass --force-recreate, replacing containers even when their compose
+          definition is unchanged. For apps that read a mounted config file
+          only at startup, where a plain `up -d` would keep the old container.
+        required: false
+        type: boolean
+        default: false
+      remove_orphans:
+        description: >-
+          Pass --remove-orphans, so a service deleted from the compose file has
+          its container removed instead of being left running unmanaged.
+        required: false
+        type: boolean
+        default: true
+      pre_deploy_commands:
+        description: >-
+          Shell commands run in the compose directory as deploy_user before the
+          deploy, for host preparation such as creating data directories or
+          fixing file modes. Runs without tracing, so nothing it touches is
+          echoed into the log.
+        required: false
+        type: string
+        default: ""
+
+      # --- verification and recovery -------------------------------------
+      wait_for_healthy:
+        description: >-
+          After the deploy, wait until every service of the project has a
+          running container - and a healthy one, where the image defines a
+          HEALTHCHECK. Catches the container that starts and immediately dies.
+        required: false
+        type: boolean
+        default: true
+      wait_timeout_seconds:
+        description: "How long to wait for the project to come up."
+        required: false
+        type: number
+        default: 120
+      rollback_on_failure:
+        description: >-
+          If the deploy or the health wait fails, check the previously deployed
+          commit back out and bring the project up again, then still fail the
+          run. Leave off for services whose new version migrates data forward,
+          where the old version can no longer read it.
+        required: false
+        type: boolean
+        default: false
+      timeout_minutes:
+        description: "Hard limit for the whole deploy job."
+        required: false
+        type: number
+        default: 15
+    outputs:
+      deployed_sha:
+        description: "Commit the host was checked out at for this deploy."
+        value: ${{ jobs.deploy.outputs.deployed_sha }}
+      previous_sha:
+        description: "Commit the host was on before this deploy, empty on a first deploy."
+        value: ${{ jobs.deploy.outputs.previous_sha }}
+      rolled_back:
+        description: "true when the deploy failed and the host was rolled back."
+        value: ${{ jobs.deploy.outputs.rolled_back }}
+
+# The deploy never touches the GitHub API and never checks out on the runner.
+permissions: {}
+
+jobs:
+  deploy:
+    name: Deploy ${{ inputs.compose_path }}
+    runs-on: [self-hosted, "${{ inputs.runner_label }}"]
+    environment: ${{ inputs.environment }}
+    timeout-minutes: ${{ inputs.timeout_minutes }}
+    # One deploy at a time per service and host: queue, never cancel a run that
+    # is already recreating containers. Deploys of *different* services on the
+    # same host do run in parallel - see the lock in the sync step below.
+    concurrency:
+      group: container-deploy-${{ inputs.runner_label }}-${{ inputs.compose_path }}
+      cancel-in-progress: false
+    outputs:
+      deployed_sha: ${{ github.sha }}
+      previous_sha: ${{ steps.sync.outputs.previous_sha }}
+      rolled_back: ${{ steps.rollback.outputs.rolled_back || 'false' }}
+    env:
+      DEPLOY_USER: ${{ inputs.deploy_user }}
+      COMPOSE_PATH: ${{ inputs.compose_path }}
+    steps:
+      # Inputs from the calling workflow end up in shell commands that run as
+      # root on a long-lived host, so they are checked before use rather than
+      # trusted.
+      - name: Validate inputs
+        env:
+          HOST_REPO_PATH: ${{ inputs.host_repo_path }}
+          COMPOSE_COMMAND: ${{ inputs.compose_command }}
+          COMPOSE_FILES: ${{ inputs.compose_files }}
+          LOCAL_CHANGES: ${{ inputs.local_changes }}
+        run: |
+          set -euo pipefail
+          fail() { echo "::error::$1"; exit 1; }
+          safe='^[A-Za-z0-9._/-]+$'
+
+          case "$COMPOSE_PATH" in
+            /*) fail "compose_path must be relative to the repository root, got '$COMPOSE_PATH'" ;;
+            *..*) fail "compose_path must not contain '..', got '$COMPOSE_PATH'" ;;
+          esac
+          [[ "$COMPOSE_PATH" =~ $safe ]] \
+            || fail "compose_path may only contain letters, digits, '.', '_', '-' and '/', got '$COMPOSE_PATH'"
+
+          [[ "$DEPLOY_USER" =~ ^[a-z_][a-z0-9_-]*$ ]] \
+            || fail "deploy_user is not a valid user name, got '$DEPLOY_USER'"
+
+          case "$COMPOSE_COMMAND" in
+            docker-compose|"docker compose"|podman-compose|"podman compose") ;;
+            *) fail "compose_command must be docker-compose, docker compose, podman-compose or podman compose, got '$COMPOSE_COMMAND'" ;;
+          esac
+
+          case "$LOCAL_CHANGES" in
+            stash|discard|fail) ;;
+            *) fail "local_changes must be stash, discard or fail, got '$LOCAL_CHANGES'" ;;
+          esac
+
+          repo_path="${HOST_REPO_PATH:-/data/${GITHUB_REPOSITORY##*/}}"
+          case "$repo_path" in
+            /*) ;;
+            *) fail "host_repo_path must be an absolute path, got '$repo_path'" ;;
+          esac
+          [[ "$repo_path" =~ $safe ]] \
+            || fail "host_repo_path may only contain letters, digits, '.', '_', '-' and '/', got '$repo_path'"
+
+          # One -f per line, so `up`, `config`, `ps` and `logs` all see the same
+          # overlay set. Empty input means compose discovers the file itself.
+          file_args=""
+          while read -r file; do
+            [ -n "$file" ] || continue
+            case "$file" in
+              /*|*..*) fail "compose_files entries must be relative to compose_path, without '..', got '$file'" ;;
+            esac
+            [[ "$file" =~ $safe ]] \
+              || fail "compose_files entries may only contain letters, digits, '.', '_', '-' and '/', got '$file'"
+            file_args="${file_args} --file ${file}"
+          done <<< "$COMPOSE_FILES"
+
+          # The engine for `inspect` follows the compose entrypoint:
+          # docker-compose -> docker, podman compose -> podman.
+          {
+            echo "REPO_PATH=${repo_path}"
+            echo "COMPOSE_DIR=${repo_path}/${COMPOSE_PATH}"
+            echo "COMPOSE=${COMPOSE_COMMAND}"
+            echo "COMPOSE_FILE_ARGS=${file_args# }"
+            echo "ENGINE=${COMPOSE_COMMAND%%[- ]*}"
+          } >> "$GITHUB_ENV"
+
+      # The deployed state is the commit, not the branch tip: two pushes in
+      # quick succession each deploy their own commit instead of both landing
+      # on whatever main points at by the time the runner picks the job up.
+      - name: Check out the deployed commit on the host
+        id: sync
+        env:
+          LOCAL_CHANGES: ${{ inputs.local_changes }}
+        run: |
+          set -euo pipefail
+          as_deploy() { sudo -u "$DEPLOY_USER" "$@"; }
+
+          if [ -d "$REPO_PATH/.git" ]; then
+            previous_sha="$(as_deploy git -C "$REPO_PATH" rev-parse HEAD)"
+          else
+            echo "No clone on this host yet, cloning ${GITHUB_REPOSITORY} into ${REPO_PATH}"
+            as_deploy git clone --quiet "git@github.com:${GITHUB_REPOSITORY}.git" "$REPO_PATH"
+            previous_sha=""
+          fi
+          echo "previous_sha=${previous_sha}" >> "$GITHUB_OUTPUT"
+          echo "PREVIOUS_SHA=${previous_sha}" >> "$GITHUB_ENV"
+
+          # Every service of this repository shares one clone on the host, so
+          # two of them writing git state at once would collide on the index.
+          # Every git write goes through this lock. Safe to interpolate:
+          # REPO_PATH was validated above, GITHUB_SHA is a hex commit id and
+          # GITHUB_RUN_ID is numeric.
+          if command -v flock >/dev/null; then
+            have_flock=true
+          else
+            have_flock=false
+            echo "::warning::flock is not installed on this host, so concurrent deploys of different services can collide on the shared git index"
+          fi
+          locked() {
+            if [ "$have_flock" = true ]; then
+              as_deploy flock "$REPO_PATH" --command "$1"
+            else
+              as_deploy sh -c "$1"
+            fi
+          }
+
+          # A tracked file edited on the host is drift. It is usually one of two
+          # things: someone debugging by hand, or an app that rewrites its own
+          # mounted config - and in the second case git and the app both think
+          # they own the file. Either way the deploy says what it found instead
+          # of quietly resolving it.
+          drift="$(as_deploy git -C "$REPO_PATH" status --porcelain --untracked-files=no)"
+          if [ -n "$drift" ]; then
+            printf '%s\n' "$drift"
+            case "$LOCAL_CHANGES" in
+              fail)
+                echo "::error::the host clone has uncommitted changes to the tracked files listed above. Commit them, or set local_changes to stash or discard."
+                exit 1
+                ;;
+              stash)
+                # -c user.*: a host clone often has no git identity, and stash
+                # writes a commit object.
+                stash="git -C ${REPO_PATH}"
+                stash="${stash} -c user.name=container-deploy"
+                stash="${stash} -c user.email=container-deploy@${RUNNER_NAME:-runner}"
+                stash="${stash} stash push --quiet"
+                stash="${stash} --message 'container-deploy run ${GITHUB_RUN_ID:-0}, superseded by ${GITHUB_SHA}'"
+                locked "$stash"
+                echo "::warning::host clone had uncommitted changes to the tracked files listed above, stashed before deploying. Recover them on the host with: git -C ${REPO_PATH} stash list"
+                ;;
+              discard)
+                echo "::warning::host clone had uncommitted changes to the tracked files listed above, discarding them"
+                ;;
+            esac
+          fi
+
+          # Exit 3 means the commit is not on the remote.
+          sync="git -C ${REPO_PATH} fetch --prune --quiet origin"
+          sync="${sync} || git -C ${REPO_PATH} fetch --quiet origin ${GITHUB_SHA};"
+          sync="${sync} git -C ${REPO_PATH} cat-file -e '${GITHUB_SHA}^{commit}' 2>/dev/null || exit 3;"
+          sync="${sync} exec git -C ${REPO_PATH} checkout --detach --force --quiet ${GITHUB_SHA}"
+
+          rc=0
+          locked "$sync" || rc=$?
+          if [ "$rc" -eq 3 ]; then
+            echo "::error::commit ${GITHUB_SHA} is not on the remote. Deploy a pushed commit - a pull_request merge ref cannot be checked out on the host."
+            exit 1
+          fi
+          [ "$rc" -eq 0 ] || exit "$rc"
+
+          [ -d "$COMPOSE_DIR" ] \
+            || { echo "::error::${COMPOSE_PATH} does not exist at commit ${GITHUB_SHA}"; exit 1; }
+          echo "Host is at ${GITHUB_SHA}."
+
+      # Fails before anything is touched when .env is missing or incomplete.
+      # -q keeps the rendered config, and any secret in it, out of the log.
+      - name: Check the compose config resolves
+        run: |
+          set -euo pipefail
+          cd "$COMPOSE_DIR"
+          # shellcheck disable=SC2086 # COMPOSE may be two words: docker compose
+          compose() { sudo -u "$DEPLOY_USER" $COMPOSE $COMPOSE_FILE_ARGS "$@"; }
+          if ! compose config --quiet; then
+            echo "::error::compose config did not resolve, see the error above. Usually ${COMPOSE_DIR}/.env is missing or lacks a required variable."
+            exit 1
+          fi
+
+      - name: Run pre-deploy commands
+        if: ${{ inputs.pre_deploy_commands != '' }}
+        env:
+          PRE_DEPLOY_COMMANDS: ${{ inputs.pre_deploy_commands }}
+        run: |
+          set -euo pipefail
+          printf '%s\n' '--- pre-deploy commands ---' "$PRE_DEPLOY_COMMANDS" '---'
+          # Piped in rather than written to a file, so nothing lands in a
+          # world-writable /tmp on a long-lived runner. No -x either: these
+          # commands may touch secrets the log should not carry.
+          {
+            printf 'cd %q || exit 1\n' "$COMPOSE_DIR"
+            printf '%s\n' "$PRE_DEPLOY_COMMANDS"
+          } | sudo -u "$DEPLOY_USER" bash -eo pipefail
+
+      - name: Deploy
+        id: deploy
+        env:
+          PULL_IMAGES: ${{ inputs.pull_images }}
+          BUILD_IMAGES: ${{ inputs.build_images }}
+          FORCE_RECREATE: ${{ inputs.force_recreate }}
+          REMOVE_ORPHANS: ${{ inputs.remove_orphans }}
+        run: |
+          set -euo pipefail
+          cd "$COMPOSE_DIR"
+          # shellcheck disable=SC2086 # COMPOSE may be two words: docker compose
+          compose() { sudo -u "$DEPLOY_USER" $COMPOSE $COMPOSE_FILE_ARGS "$@"; }
+
+          if [ "$PULL_IMAGES" = "true" ]; then
+            compose pull
+          fi
+
+          args=(up --detach)
+          if [ "$BUILD_IMAGES" = "true" ]; then args+=(--build); fi
+          if [ "$FORCE_RECREATE" = "true" ]; then args+=(--force-recreate); fi
+          if [ "$REMOVE_ORPHANS" = "true" ]; then args+=(--remove-orphans); fi
+
+          echo "+ ${COMPOSE} ${args[*]}"
+          compose "${args[@]}"
+
+      # A container that starts and dies is the failure mode `up -d` cannot
+      # report: it exits 0 the moment the container is created. With
+      # restart: unless-stopped a crash loop shows up as restarting rather than
+      # exited, so both are treated as not-ready until the deadline.
+      - name: Wait for the project to be healthy
+        if: ${{ inputs.wait_for_healthy }}
+        env:
+          TIMEOUT: ${{ inputs.wait_timeout_seconds }}
+        run: |
+          set -euo pipefail
+          cd "$COMPOSE_DIR"
+          # shellcheck disable=SC2086 # COMPOSE may be two words: docker compose
+          compose() { sudo -u "$DEPLOY_USER" $COMPOSE $COMPOSE_FILE_ARGS "$@"; }
+
+          readarray -t services < <(compose config --services)
+          [ "${#services[@]}" -gt 0 ] \
+            || { echo "::error::the compose file defines no services"; exit 1; }
+
+          deadline=$(( $(date +%s) + TIMEOUT ))
+          while true; do
+            # `ps` takes no service argument on podman-compose, and compose v2
+            # hides stopped containers without --all, which podman-compose in
+            # turn does not know. So: list the whole project, then read each
+            # container's service off its label.
+            readarray -t ids < <(compose ps --quiet --all 2>/dev/null || compose ps --quiet)
+
+            report=""
+            seen=" "
+            labelled=true
+            pending=()
+            for cid in "${ids[@]}"; do
+              [ -n "$cid" ] || continue
+              IFS='|' read -r svc name state health restarts <<< "$(
+                sudo -u "$DEPLOY_USER" "$ENGINE" inspect --format \
+                  '{{index .Config.Labels "com.docker.compose.service"}}|{{.Name}}|{{.State.Status}}|{{if .State.Health}}{{.State.Health.Status}}{{else}}no-healthcheck{{end}}|{{.RestartCount}}' \
+                  "$cid")"
+              if [ -n "$svc" ]; then seen="${seen}${svc} "; else labelled=false; fi
+              report+="  ${name#/}: ${state}/${health}, ${restarts} restart(s)"$'\n'
+              case "${state}/${health}" in
+                running/healthy|running/no-healthcheck) ;;
+                *) pending+=("${svc:-${name#/}}") ;;
+              esac
+            done
+
+            # A service whose container was never created, or was removed, has
+            # nothing to inspect - catch it by what is missing.
+            if [ "$labelled" = true ]; then
+              for svc in "${services[@]}"; do
+                case "$seen" in
+                  *" ${svc} "*) ;;
+                  *) report+="  ${svc}: no container"$'\n'; pending+=("$svc") ;;
+                esac
+              done
+            fi
+
+            printf '%s' "$report"
+            if [ "${#pending[@]}" -eq 0 ]; then
+              echo "All ${#services[@]} service(s) are up."
+              exit 0
+            fi
+            if [ "$(date +%s)" -ge "$deadline" ]; then
+              echo "::error::not up within ${TIMEOUT}s: ${pending[*]}"
+              compose logs --tail 50 --no-color || true
+              exit 1
+            fi
+            sleep 3
+          done
+
+      # Puts the host back on the last commit that deployed cleanly. The run
+      # still fails: a rollback is a safety net, not a green build.
+      - name: Roll back to the previous commit
+        id: rollback
+        if: ${{ failure() && inputs.rollback_on_failure && steps.deploy.outcome != 'skipped' }}
+        env:
+          BUILD_IMAGES: ${{ inputs.build_images }}
+          REMOVE_ORPHANS: ${{ inputs.remove_orphans }}
+        run: |
+          set -euo pipefail
+          as_deploy() { sudo -u "$DEPLOY_USER" "$@"; }
+          # shellcheck disable=SC2086 # COMPOSE may be two words: docker compose
+          compose() { sudo -u "$DEPLOY_USER" $COMPOSE $COMPOSE_FILE_ARGS "$@"; }
+
+          if [ -z "${PREVIOUS_SHA:-}" ]; then
+            echo "::warning::no previous commit on this host, nothing to roll back to"
+            exit 0
+          fi
+          if [ "$PREVIOUS_SHA" = "$GITHUB_SHA" ]; then
+            echo "::warning::the host was already on ${GITHUB_SHA}, nothing to roll back to"
+            exit 0
+          fi
+
+          # A service that did not exist before cannot be rolled back to an
+          # older definition - tear down what this run created instead.
+          if as_deploy git -C "$REPO_PATH" rev-parse --verify --quiet "${PREVIOUS_SHA}:${COMPOSE_PATH}" >/dev/null; then
+            echo "Rolling ${COMPOSE_PATH} back to ${PREVIOUS_SHA}"
+            as_deploy git -C "$REPO_PATH" checkout --detach --force --quiet "$PREVIOUS_SHA"
+            cd "$COMPOSE_DIR"
+            args=(up --detach --force-recreate)
+            if [ "$BUILD_IMAGES" = "true" ]; then args+=(--build); fi
+            if [ "$REMOVE_ORPHANS" = "true" ]; then args+=(--remove-orphans); fi
+            compose "${args[@]}"
+          else
+            echo "::warning::${COMPOSE_PATH} did not exist at ${PREVIOUS_SHA}, tearing the new project down instead"
+            cd "$COMPOSE_DIR"
+            compose down --remove-orphans
+            as_deploy git -C "$REPO_PATH" checkout --detach --force --quiet "$PREVIOUS_SHA"
+          fi
+          echo "rolled_back=true" >> "$GITHUB_OUTPUT"
+          echo "::error::deploy of ${GITHUB_SHA} failed, host rolled back to ${PREVIOUS_SHA}"
+
+      - name: Summary
+        if: ${{ always() && steps.sync.outcome == 'success' }}
+        env:
+          ROLLED_BACK: ${{ steps.rollback.outputs.rolled_back }}
+        run: |
+          set -euo pipefail
+          # shellcheck disable=SC2086 # COMPOSE may be two words: docker compose
+          compose() { sudo -u "$DEPLOY_USER" $COMPOSE $COMPOSE_FILE_ARGS "$@"; }
+          {
+            if [ "${ROLLED_BACK:-}" = "true" ]; then
+              echo "### Rolled back ${COMPOSE_PATH}"
+            else
+              echo "### ${COMPOSE_PATH} on ${{ inputs.runner_label }}"
+            fi
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            echo "| Commit | \`${GITHUB_SHA}\` |"
+            echo "| Previous | \`${PREVIOUS_SHA:-none}\` |"
+            echo "| Host path | \`${COMPOSE_DIR}\` |"
+            echo ""
+            echo '```'
+            cd "$COMPOSE_DIR" && compose ps 2>&1 || echo "compose ps unavailable"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+...

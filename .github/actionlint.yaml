@@ -1,3 +1,4 @@
-# Nur von GitHub gehostete Runner in diesem Repository.
+# container-deploy.yml targets self-hosted runners, but its labels come from
+# a workflow_call input, so there is nothing static to validate here.
 self-hosted-runner:
   labels: []
