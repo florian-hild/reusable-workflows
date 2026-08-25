@@ -236,6 +236,7 @@ jobs:
           # docker-compose -> docker, podman compose -> podman.
           {
             echo "REPO_PATH=${repo_path}"
+            echo "LOCK_DIR=${repo_path%/*}"
             echo "COMPOSE_DIR=${repo_path}/${COMPOSE_PATH}"
             echo "COMPOSE=${COMPOSE_COMMAND}"
             echo "COMPOSE_FILE_ARGS=${file_args# }"
@@ -253,21 +254,15 @@ jobs:
           set -euo pipefail
           as_deploy() { sudo -u "$DEPLOY_USER" "$@"; }
 
-          if [ -d "$REPO_PATH/.git" ]; then
-            previous_sha="$(as_deploy git -C "$REPO_PATH" rev-parse HEAD)"
-          else
-            echo "No clone on this host yet, cloning ${GITHUB_REPOSITORY} into ${REPO_PATH}"
-            as_deploy git clone --quiet "git@github.com:${GITHUB_REPOSITORY}.git" "$REPO_PATH"
-            previous_sha=""
-          fi
-          echo "previous_sha=${previous_sha}" >> "$GITHUB_OUTPUT"
-          echo "PREVIOUS_SHA=${previous_sha}" >> "$GITHUB_ENV"
-
           # Every service of this repository shares one clone on the host, so
-          # two of them writing git state at once would collide on the index.
-          # Every git write goes through this lock. Safe to interpolate:
-          # REPO_PATH was validated above, GITHUB_SHA is a hex commit id and
-          # GITHUB_RUN_ID is numeric.
+          # two of them touching git at once would collide on the index - and
+          # even `git status` writes it when it refreshes stat info. So every
+          # git call below goes through this lock, including the clone.
+          #
+          # The lock is the clone's *parent*: REPO_PATH does not exist yet on a
+          # first deploy, so it cannot be locked before the clone that creates
+          # it. Safe to interpolate: LOCK_DIR and REPO_PATH were validated
+          # above and GITHUB_SHA is a hex commit id.
           if command -v flock >/dev/null; then
             have_flock=true
           else
@@ -276,18 +271,28 @@ jobs:
           fi
           locked() {
             if [ "$have_flock" = true ]; then
-              as_deploy flock "$REPO_PATH" --command "$1"
+              as_deploy flock "$LOCK_DIR" --command "$1"
             else
               as_deploy sh -c "$1"
             fi
           }
+
+          if [ -d "$REPO_PATH/.git" ]; then
+            previous_sha="$(locked "git -C ${REPO_PATH} rev-parse HEAD")"
+          else
+            echo "No clone on this host yet, cloning ${GITHUB_REPOSITORY} into ${REPO_PATH}"
+            locked "test -d ${REPO_PATH}/.git || git clone --quiet git@github.com:${GITHUB_REPOSITORY}.git ${REPO_PATH}"
+            previous_sha=""
+          fi
+          echo "previous_sha=${previous_sha}" >> "$GITHUB_OUTPUT"
+          echo "PREVIOUS_SHA=${previous_sha}" >> "$GITHUB_ENV"
 
           # A tracked file edited on the host is drift. It is usually one of two
           # things: someone debugging by hand, or an app that rewrites its own
           # mounted config - and in the second case git and the app both think
           # they own the file. Either way the deploy says what it found instead
           # of quietly resolving it.
-          drift="$(as_deploy git -C "$REPO_PATH" status --porcelain --untracked-files=no)"
+          drift="$(locked "git -C ${REPO_PATH} status --porcelain --untracked-files=no")"
           if [ -n "$drift" ]; then
             printf '%s\n' "$drift"
             case "$LOCAL_CHANGES" in
@@ -300,7 +305,7 @@ jobs:
                 # writes a commit object.
                 stash="git -C ${REPO_PATH}"
                 stash="${stash} -c user.name=container-deploy"
-                stash="${stash} -c user.email=container-deploy@${RUNNER_NAME:-runner}"
+                stash="${stash} -c user.email=container-deploy@localhost"
                 stash="${stash} stash push --quiet"
                 stash="${stash} --message 'container-deploy run ${GITHUB_RUN_ID:-0}, superseded by ${GITHUB_SHA}'"
                 locked "$stash"
@@ -464,6 +469,15 @@ jobs:
           as_deploy() { sudo -u "$DEPLOY_USER" "$@"; }
           # shellcheck disable=SC2086 # COMPOSE may be two words: docker compose
           compose() { sudo -u "$DEPLOY_USER" $COMPOSE $COMPOSE_FILE_ARGS "$@"; }
+          # Same lock as the sync step: another service may be mid-checkout on
+          # this shared clone while we roll back.
+          locked() {
+            if command -v flock >/dev/null; then
+              as_deploy flock "$LOCK_DIR" --command "$1"
+            else
+              as_deploy sh -c "$1"
+            fi
+          }
 
           if [ -z "${PREVIOUS_SHA:-}" ]; then
             echo "::warning::no previous commit on this host, nothing to roll back to"
@@ -476,9 +490,9 @@ jobs:
 
           # A service that did not exist before cannot be rolled back to an
           # older definition - tear down what this run created instead.
-          if as_deploy git -C "$REPO_PATH" rev-parse --verify --quiet "${PREVIOUS_SHA}:${COMPOSE_PATH}" >/dev/null; then
+          if locked "git -C ${REPO_PATH} rev-parse --verify --quiet ${PREVIOUS_SHA}:${COMPOSE_PATH}" >/dev/null; then
             echo "Rolling ${COMPOSE_PATH} back to ${PREVIOUS_SHA}"
-            as_deploy git -C "$REPO_PATH" checkout --detach --force --quiet "$PREVIOUS_SHA"
+            locked "git -C ${REPO_PATH} checkout --detach --force --quiet ${PREVIOUS_SHA}"
             cd "$COMPOSE_DIR"
             args=(up --detach --force-recreate)
             if [ "$BUILD_IMAGES" = "true" ]; then args+=(--build); fi
@@ -488,7 +502,7 @@ jobs:
             echo "::warning::${COMPOSE_PATH} did not exist at ${PREVIOUS_SHA}, tearing the new project down instead"
             cd "$COMPOSE_DIR"
             compose down --remove-orphans
-            as_deploy git -C "$REPO_PATH" checkout --detach --force --quiet "$PREVIOUS_SHA"
+            locked "git -C ${REPO_PATH} checkout --detach --force --quiet ${PREVIOUS_SHA}"
           fi
           echo "rolled_back=true" >> "$GITHUB_OUTPUT"
           echo "::error::deploy of ${GITHUB_SHA} failed, host rolled back to ${PREVIOUS_SHA}"
