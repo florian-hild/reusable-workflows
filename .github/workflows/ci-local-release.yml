@@ -54,9 +54,6 @@ jobs:
         with:
           bump_version: "true"
 
-      # floating_tags: these workflows are called as "@v1", so this
-      # repository is one of the few that needs the moving tags. Off by
-      # default everywhere else.
       - name: Publish tags
         uses: florian-hild/actions/release-tags@v2
         with:
