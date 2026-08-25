@@ -76,17 +76,6 @@ on:
         required: false
         type: boolean
         default: false
-      floating_tags:
-        description: >-
-          Publish the floating "<tag_prefix><major>" and
-          "<tag_prefix><major>.<minor>" git tags next to the full version. Off
-          by default: images are deployed by exact version, and a repository
-          releasing several components under their own prefix would otherwise
-          carry two moving tags per component. Container image tags are not
-          affected and always include the floating variants.
-        required: false
-        type: boolean
-        default: false
       publish_container:
         description: "Publish the container image. Turn off to build but not push the image."
         required: false
@@ -302,7 +291,6 @@ jobs:
         with:
           version: ${{ steps.get-version.outputs.version }}
           tag_prefix: ${{ inputs.tag_prefix }}
-          floating_tags: ${{ inputs.floating_tags }}
 
       - name: Summary
         if: ${{ steps.get-version.outputs.version != '' }}
