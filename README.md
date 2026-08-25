@@ -60,11 +60,6 @@ Container tags carry no `v` so they read naturally in a compose file, git tags
 do. The size of the bump comes from the commit **subjects**: `(MAJOR)`,
 `(MINOR)`, patch otherwise.
 
-The floating git tags `v1.4` and `v1` are published only with
-`floating_tags: true`, for a repository whose consumers pin a moving line the
-way these workflows are called as `@v1`. Container image tags are unaffected
-and always include the floating variants.
-
 ## Versioning several things in one repository
 
 A monorepo that releases several images independently must not let every
@@ -86,12 +81,6 @@ commit bump every version. Point `change_path` at the component and turn
 `schedule` and `workflow_dispatch` events always bump, so periodic rebuilds
 keep releasing patches. Note that `(MAJOR)`/`(MINOR)` markers are read from
 all commits in a push, not only those touching `change_path`.
-
-Each component is tagged with its full version only, so a repository with
-ten components does not accumulate twenty moving refs. Add
-`floating_tags: true` where something does follow `<prefix><major>`. Version
-detection is unaffected either way: it only ever reads tags with three
-dot-separated parts.
 
 ## Permissions
 
