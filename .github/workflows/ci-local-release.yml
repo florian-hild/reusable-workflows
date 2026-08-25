@@ -50,11 +50,15 @@ jobs:
       # releasable changed, so no second change detection is needed.
       - name: Determine next version
         id: version
-        uses: florian-hild/actions/next-version@v1
+        uses: florian-hild/actions/next-version@v2
         with:
           bump_version: "true"
 
+      # floating_tags: these workflows are called as "@v1", so this
+      # repository is one of the few that needs the moving tags. Off by
+      # default everywhere else.
       - name: Publish tags
-        uses: florian-hild/actions/release-tags@v1
+        uses: florian-hild/actions/release-tags@v2
         with:
           version: ${{ steps.version.outputs.version }}
+          floating_tags: "true"
