@@ -50,11 +50,12 @@ jobs:
       # releasable changed, so no second change detection is needed.
       - name: Determine next version
         id: version
-        uses: florian-hild/actions/next-version@v1
+        uses: florian-hild/actions/next-version@v2
         with:
           bump_version: "true"
 
       - name: Publish tags
-        uses: florian-hild/actions/release-tags@v1
+        uses: florian-hild/actions/release-tags@v2
         with:
           version: ${{ steps.version.outputs.version }}
+          floating_tags: "true"

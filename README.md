@@ -49,11 +49,11 @@ jobs:
       registry_token: ${{ secrets.REPO_PAT_TOKEN }}
 ```
 
-On `main` this publishes container tags and git tags together:
+On `main` this publishes container tags and one git tag:
 
 ```
 image:1.4.2   image:1.4   image:1   image:latest
-v1.4.2        v1.4        v1
+v1.4.2
 ```
 
 Container tags carry no `v` so they read naturally in a compose file, git tags
