@@ -1,0 +1,380 @@
+---
+name: Go release
+run-name: Go release
+
+# Build static Go binaries for every target platform and attach them to a
+# GitHub release.
+#
+# This exists because one thing in the house is installed as a binary rather
+# than run as a container: a daemon that drives the local docker socket is
+# simpler and no less secure outside a container than inside one with the
+# socket mounted in.
+#
+# It declares no permissions of its own; see the note on the job below for
+# what the calling job has to grant.
+#
+# It does not compute a version and does not push a tag: it is handed both, so
+# that a repository releasing an image and a binary together publishes one
+# version, not two that drift. The caller either passes container-build.yml's
+# version output, or - with no image to build - calls next-version and
+# release-tags itself. An empty version means that step decided there was
+# nothing to release, and so does this.
+
+on:
+  workflow_call:
+    inputs:
+      version:
+        description: >-
+          Version to release, e.g. 1.4.2. Comes from container-build.yml's
+          version output, or from a next-version step in the caller. The
+          matching git tag must already exist. Empty skips the whole job.
+        required: true
+        type: string
+      working_directory:
+        description: "Directory containing go.mod."
+        required: false
+        type: string
+        default: "."
+      main_package:
+        description: "Package to build, relative to working_directory."
+        required: false
+        type: string
+        default: "./cmd/..."
+      binary_name:
+        description: >-
+          Base name of the published artifacts. Each becomes
+          <binary_name>_<goos>_<goarch>. Empty uses the name Go gives the
+          binary, which is the last element of main_package.
+        required: false
+        type: string
+        default: ""
+      tag_prefix:
+        description: >-
+          Prefix of the git tag, matching the tag_prefix the tag was published
+          with. The tag is <tag_prefix><version>.
+        required: false
+        type: string
+        default: "v"
+      go_version_file:
+        description: "File the Go version is read from, relative to working_directory."
+        required: false
+        type: string
+        default: "go.mod"
+      platforms:
+        description: "Comma-separated GOOS/GOARCH pairs to build."
+        required: false
+        type: string
+        default: "linux/amd64,linux/arm64"
+      ldflags_version_var:
+        description: >-
+          Fully qualified variable the version is linked into, e.g.
+          main.version. Empty builds without it, and the binary then reports
+          whatever its default is.
+        required: false
+        type: string
+        default: "main.version"
+      build_tags:
+        description: "Comma-separated build tags."
+        required: false
+        type: string
+        default: ""
+      attestations:
+        description: >-
+          Publish a signed build provenance attestation for every binary, so a
+          downloader can prove with `gh attestation verify` which workflow and
+          which commit produced the file. On means the calling job must grant
+          id-token: write and attestations: write on top of contents: write.
+        required: false
+        type: boolean
+        default: true
+      checksums:
+        description: "Publish a SHA256SUMS file alongside the binaries."
+        required: false
+        type: boolean
+        default: true
+      generate_notes:
+        description: "Let GitHub generate the release notes from the commits."
+        required: false
+        type: boolean
+        default: true
+
+# No permissions key here either, and this is the one place in the repository
+# where the house default of "contents: read" would be actively wrong: it is
+# the workflow-level default for the job below, so the job would inherit read
+# and gh release create would 403.
+
+jobs:
+  go-release:
+    name: Build and publish binaries
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    if: ${{ inputs.version != '' }}
+    # No permissions block on purpose, so the job inherits the calling job's.
+    #
+    # A called workflow can only narrow what the caller granted - asking for
+    # more fails the run before a single step executes. Declaring id-token and
+    # attestations here would therefore force every caller to grant both even
+    # with attestations off, since `permissions` takes no expressions and the
+    # block cannot be made conditional. The input would be a choice in name
+    # only.
+    #
+    # What the calling job must grant:
+    #   contents: write                       always, to create the release
+    #   id-token: write, attestations: write  additionally, for attestations
+    #
+    # The cost is that this job no longer drops anything the caller granted
+    # more broadly. Grant permissions on the calling job, not workflow-wide.
+    # Never cancelled: a half-uploaded release is worse than a slow one, and
+    # two runs would race for the same tag.
+    concurrency:
+      group: ${{ github.workflow }}-go-release-${{ inputs.working_directory }}-${{ inputs.version }}
+      cancel-in-progress: false
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The tag was pushed by the job that produced this version, after
+          # this workflow's own ref was resolved. Fetch it explicitly.
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ inputs.working_directory }}/${{ inputs.go_version_file }}
+          cache-dependency-path: ${{ inputs.working_directory }}/go.sum
+
+      # -trimpath so the binary carries no build-host paths, -s -w so it
+      # carries no symbol table: both make the artifact reproducible for
+      # anyone who wants to rebuild and compare it.
+      - name: Build
+        id: build
+        shell: bash
+        env:
+          BINARY_NAME: ${{ inputs.binary_name }}
+          BUILD_TAGS: ${{ inputs.build_tags }}
+          LDFLAGS_VERSION_VAR: ${{ inputs.ldflags_version_var }}
+          MAIN_PACKAGE: ${{ inputs.main_package }}
+          PLATFORMS: ${{ inputs.platforms }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+
+          # A workflow command reads %, CR and LF as syntax, so anything that
+          # comes from a tool or an input has to be escaped before it goes in.
+          # Property values carry two more: a comma or a colon would end the
+          # property early and let the rest of a path inject further commands.
+          escape_message() {
+            local value="${1//%/%25}"
+            value="${value//$'\r'/%0D}"
+            printf '%s' "${value//$'\n'/%0A}"
+          }
+
+          escape_property() {
+            local value
+            value="$(escape_message "$1")"
+            value="${value//,/%2C}"
+            printf '%s' "${value//:/%3A}"
+          }
+
+          ldflags="-s -w"
+          if [[ -n "${LDFLAGS_VERSION_VAR}" ]]; then
+            ldflags+=" -X ${LDFLAGS_VERSION_VAR}=${VERSION}"
+          fi
+
+          args=(-trimpath "-ldflags=${ldflags}")
+          if [[ -n "${BUILD_TAGS}" ]]; then
+            args+=("-tags=${BUILD_TAGS}")
+          fi
+          read -ra pkgs <<< "${MAIN_PACKAGE}"
+
+          dist="${RUNNER_TEMP}/dist"
+          stage="${RUNNER_TEMP}/stage"
+          rm -rf "${dist}" "${stage}"
+          mkdir -p "${dist}"
+
+          IFS=',' read -ra platforms <<< "${PLATFORMS}"
+          for platform in "${platforms[@]}"; do
+            platform="${platform// /}"
+            [[ -n "${platform}" ]] || continue
+            goos="${platform%%/*}"
+            goarch="${platform##*/}"
+
+            rm -rf "${stage}"
+            mkdir -p "${stage}"
+            echo "Building ${goos}/${goarch}"
+            GOOS="${goos}" GOARCH="${goarch}" CGO_ENABLED=0 \
+              go build "${args[@]}" -o "${stage}/" "${pkgs[@]}"
+
+            # nullglob, or an empty directory yields the unexpanded pattern
+            # as a single element and the guard below sees one "binary". That
+            # happens whenever main_package matches only non-main packages:
+            # go build succeeds and writes nothing.
+            shopt -s nullglob
+            built=("${stage}"/*)
+            shopt -u nullglob
+
+            if [[ "${#built[@]}" -ne 1 ]]; then
+              printf '::error::%s\n' \
+                "$(escape_message "main_package '${MAIN_PACKAGE}' produced ${#built[@]} binaries; name exactly one")"
+              exit 1
+            fi
+
+            name="${BINARY_NAME}"
+            if [[ -z "${name}" ]]; then
+              name="$(basename "${built[0]}")"
+            fi
+            mv "${built[0]}" "${dist}/${name}_${goos}_${goarch}"
+          done
+
+          if [[ -z "$(ls -A "${dist}")" ]]; then
+            printf '::error::%s\n' \
+              "$(escape_message "platforms '${PLATFORMS}' produced no binaries")"
+            exit 1
+          fi
+
+          {
+            printf 'dist=%s\n' "${dist}"
+            printf 'go_version=%s\n' "$(go env GOVERSION)"
+          } >> "${GITHUB_OUTPUT}"
+          ls -l "${dist}"
+
+      # Before SHA256SUMS is written, so dist/ still holds nothing but the
+      # binaries. A checksum file is not a build artifact and attesting it
+      # would only add a subject nobody verifies.
+      #
+      # SHA256SUMS says the file was not corrupted in transit. This says who
+      # built it, from which commit, in which workflow run - which is the
+      # question that matters for a binary that lands in /usr/local/bin on a
+      # host with the docker socket.
+      - name: Attest build provenance
+        if: inputs.attestations
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: ${{ steps.build.outputs.dist }}/*
+
+      - name: Write SHA256SUMS
+        if: inputs.checksums
+        shell: bash
+        env:
+          DIST: ${{ steps.build.outputs.dist }}
+        run: |
+          set -euo pipefail
+          cd "${DIST}"
+          sha256sum -- * > SHA256SUMS
+          cat SHA256SUMS
+
+      # gh release create rather than an action: it is on every runner, it is
+      # what an operator would type, and it needs no third-party pin.
+      - name: Publish the release
+        shell: bash
+        env:
+          ATTESTATIONS: ${{ inputs.attestations }}
+          DIST: ${{ steps.build.outputs.dist }}
+          GENERATE_NOTES: ${{ inputs.generate_notes }}
+          GH_TOKEN: ${{ github.token }}
+          GO_VERSION: ${{ steps.build.outputs.go_version }}
+          PLATFORMS: ${{ inputs.platforms }}
+          TAG: ${{ inputs.tag_prefix }}${{ inputs.version }}
+          TAG_PREFIX: ${{ inputs.tag_prefix }}
+        run: |
+          set -euo pipefail
+
+          # A workflow command reads %, CR and LF as syntax, so anything that
+          # comes from a tool or an input has to be escaped before it goes in.
+          # Property values carry two more: a comma or a colon would end the
+          # property early and let the rest of a path inject further commands.
+          escape_message() {
+            local value="${1//%/%25}"
+            value="${value//$'\r'/%0D}"
+            printf '%s' "${value//$'\n'/%0A}"
+          }
+
+          escape_property() {
+            local value
+            value="$(escape_message "$1")"
+            value="${value//,/%2C}"
+            printf '%s' "${value//:/%3A}"
+          }
+
+          if ! git rev-parse -q --verify "refs/tags/${TAG}" > /dev/null; then
+            printf '::error::%s\n' \
+              "$(escape_message "tag ${TAG} does not exist; run this after the job that publishes tags")"
+            exit 1
+          fi
+
+          notes="${RUNNER_TEMP}/release-notes.md"
+          : > "${notes}"
+
+          # The notes are assembled here rather than left to
+          # `gh release create --generate-notes`, for two reasons. Appending
+          # to them is only possible if we hold them, and the API needs to be
+          # told where the previous release ended: its default is the newest
+          # release in the repository, which in a monorepo is whichever app
+          # published last, so the notes would list another app's commits.
+          if [[ "${GENERATE_NOTES}" == "true" ]]; then
+            prev="$(git tag --list "${TAG_PREFIX}*" --sort=-v:refname \
+              | grep -vFx "${TAG}" | head -n 1 || true)"
+            fields=(-f "tag_name=${TAG}")
+            if [[ -n "${prev}" ]]; then
+              echo "Generating notes since ${prev}."
+              fields+=(-f "previous_tag_name=${prev}")
+            else
+              echo "No earlier ${TAG_PREFIX} tag; letting GitHub pick the range."
+            fi
+            gh api --method POST \
+              "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
+              "${fields[@]}" --jq .body >> "${notes}"
+            printf '\n' >> "${notes}"
+          fi
+
+          # What the commits alone do not say: which tree these exact bytes
+          # came from, and which run produced them. Without the run link the
+          # only way back to the build log is to guess from the timestamps,
+          # and logs expire long before a binary does.
+          # shellcheck disable=SC2016 # ``` is a markdown fence, not a substitution
+          {
+            echo "## Build"
+            echo ""
+            echo "| | |"
+            echo "|---|---|"
+            printf '| Commit | [`%s`](%s/%s/commit/%s) |\n' \
+              "${GITHUB_SHA:0:12}" "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_SHA}"
+            printf '| Workflow run | [%s #%s](%s/%s/actions/runs/%s) |\n' \
+              "${GITHUB_WORKFLOW}" "${GITHUB_RUN_NUMBER}" \
+              "${GITHUB_SERVER_URL}" "${GITHUB_REPOSITORY}" "${GITHUB_RUN_ID}"
+            printf '| Go | %s |\n' "${GO_VERSION}"
+            printf '| Platforms | `%s` |\n' "${PLATFORMS}"
+            echo ""
+            echo "Verify a download:"
+            echo ""
+            echo '```bash'
+            echo "sha256sum --ignore-missing -c SHA256SUMS"
+            if [[ "${ATTESTATIONS}" == "true" ]]; then
+              printf 'gh attestation verify <file> --repo %s\n' "${GITHUB_REPOSITORY}"
+            fi
+            echo '```'
+          } >> "${notes}"
+
+          if gh release view "${TAG}" > /dev/null 2>&1; then
+            # A re-run of a partially failed release: refresh the notes too,
+            # or the run link points at the attempt that did not finish.
+            echo "Release ${TAG} exists, uploading assets to it."
+            gh release upload "${TAG}" "${DIST}"/* --clobber
+            gh release edit "${TAG}" --notes-file "${notes}"
+          else
+            gh release create "${TAG}" "${DIST}"/* \
+              --title "${TAG}" --notes-file "${notes}"
+          fi
+
+          {
+            echo "### Release ${TAG}"
+            echo ""
+            echo '```'
+            ls -1 "${DIST}"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+...

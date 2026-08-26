@@ -1,0 +1,273 @@
+---
+name: Go lint
+run-name: Go lint
+
+# gofmt, go vet and staticcheck over a Go module.
+#
+# Not golangci-lint: it needs a .golangci.yml per consumer to be useful, and
+# these three are what the Go toolchain itself considers wrong. Each is a
+# separate switch so a repository can adopt the checks one at a time.
+#
+# The Go version comes from the module's own go.mod, so a repository upgrades
+# by editing the file it already has to edit.
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        description: "Directory containing go.mod."
+        required: false
+        type: string
+        default: "."
+      packages:
+        description: "Package pattern passed to go vet and staticcheck."
+        required: false
+        type: string
+        default: "./..."
+      go_version_file:
+        description: "File the Go version is read from, relative to working_directory."
+        required: false
+        type: string
+        default: "go.mod"
+      check_format:
+        description: "Fail on files that gofmt would rewrite."
+        required: false
+        type: boolean
+        default: true
+      staticcheck:
+        description: "Also run staticcheck."
+        required: false
+        type: boolean
+        default: true
+      staticcheck_version:
+        description: >-
+          Version of staticcheck to run. Pinned rather than latest: a new
+          release adds checks, and a dependency update should not turn a green
+          repository red on a day nobody touched it.
+        required: false
+        type: string
+        default: "2025.1.1"
+      build_tags:
+        description: "Comma-separated build tags, e.g. 'integration'."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  go-lint:
+    name: gofmt, vet, staticcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    concurrency:
+      group: ${{ github.workflow }}-go-lint-${{ inputs.working_directory }}-${{ github.ref }}
+      cancel-in-progress: true
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ inputs.working_directory }}/${{ inputs.go_version_file }}
+          cache-dependency-path: ${{ inputs.working_directory }}/go.sum
+
+      # gofmt has no --check and no exit code: an empty listing is the pass
+      # condition. The listing is only file names, which is unreadable in a log
+      # and useless on a pull request, so each one becomes an annotation.
+      - name: Run gofmt
+        if: inputs.check_format
+        shell: bash
+        env:
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+
+          # A workflow command reads %, CR and LF as syntax, so anything that
+          # comes from a tool or an input has to be escaped before it goes in.
+          # Property values carry two more: a comma or a colon would end the
+          # property early and let the rest of a path inject further commands.
+          escape_message() {
+            local value="${1//%/%25}"
+            value="${value//$'\r'/%0D}"
+            printf '%s' "${value//$'\n'/%0A}"
+          }
+
+          escape_property() {
+            local value
+            value="$(escape_message "$1")"
+            value="${value//,/%2C}"
+            printf '%s' "${value//:/%3A}"
+          }
+
+          unformatted="$(gofmt -l .)"
+          if [[ -z "${unformatted}" ]]; then
+            echo "All files are gofmt-clean."
+            exit 0
+          fi
+
+          prefix=""
+          if [[ "${WORKING_DIRECTORY}" != "." ]]; then
+            prefix="${WORKING_DIRECTORY%/}/"
+          fi
+
+          while IFS= read -r file; do
+            printf '::error file=%s::not gofmt-clean, run gofmt -w\n' \
+              "$(escape_property "${prefix}${file#./}")"
+          done <<< "${unformatted}"
+
+          {
+            echo "### gofmt"
+            echo ""
+            echo "These files are not formatted. Run \`gofmt -w .\` locally."
+            echo ""
+            echo '```'
+            echo "${unformatted}"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          exit 1
+
+      # Runs even when gofmt failed, so one push surfaces both kinds of problem
+      # instead of only the first.
+      - name: Run go vet
+        if: ${{ !cancelled() }}
+        shell: bash
+        env:
+          BUILD_TAGS: ${{ inputs.build_tags }}
+          PACKAGES: ${{ inputs.packages }}
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+
+          # A workflow command reads %, CR and LF as syntax, so anything that
+          # comes from a tool or an input has to be escaped before it goes in.
+          # Property values carry two more: a comma or a colon would end the
+          # property early and let the rest of a path inject further commands.
+          escape_message() {
+            local value="${1//%/%25}"
+            value="${value//$'\r'/%0D}"
+            printf '%s' "${value//$'\n'/%0A}"
+          }
+
+          escape_property() {
+            local value
+            value="$(escape_message "$1")"
+            value="${value//,/%2C}"
+            printf '%s' "${value//:/%3A}"
+          }
+
+          # go vet and staticcheck both write file:line:col: message, with the
+          # path relative to the module. An annotation is resolved against the
+          # repository root, so a nested module needs its prefix back or the
+          # annotation points at a file that does not exist and never appears
+          # on the pull request.
+          annotate() {
+            local line prefix=""
+            if [[ "${WORKING_DIRECTORY}" != "." ]]; then
+              prefix="${WORKING_DIRECTORY%/}/"
+            fi
+            while IFS= read -r line; do
+              if [[ "${line}" =~ ^([^[:space:]]+\.go):([0-9]+):([0-9]+):[[:space:]](.*)$ ]]; then
+                printf '::error file=%s,line=%s,col=%s::%s\n' \
+                  "$(escape_property "${prefix}${BASH_REMATCH[1]#./}")" \
+                  "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" \
+                  "$(escape_message "${BASH_REMATCH[4]}")"
+              fi
+            done < "$1"
+          }
+
+          args=()
+          if [[ -n "${BUILD_TAGS}" ]]; then
+            args+=("-tags=${BUILD_TAGS}")
+          fi
+          read -ra pkgs <<< "${PACKAGES}"
+
+          status=0
+          go vet "${args[@]}" "${pkgs[@]}" 2> "${RUNNER_TEMP}/vet.txt" || status=$?
+          cat "${RUNNER_TEMP}/vet.txt"
+
+          annotate "${RUNNER_TEMP}/vet.txt"
+
+          exit "${status}"
+
+      # go run rather than go install: the version is named at the call site,
+      # nothing enters the module's require graph, and the same command works
+      # in a Makefile on a laptop.
+      - name: Run staticcheck
+        if: ${{ !cancelled() && inputs.staticcheck }}
+        shell: bash
+        env:
+          BUILD_TAGS: ${{ inputs.build_tags }}
+          PACKAGES: ${{ inputs.packages }}
+          STATICCHECK_VERSION: ${{ inputs.staticcheck_version }}
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+
+          # A workflow command reads %, CR and LF as syntax, so anything that
+          # comes from a tool or an input has to be escaped before it goes in.
+          # Property values carry two more: a comma or a colon would end the
+          # property early and let the rest of a path inject further commands.
+          escape_message() {
+            local value="${1//%/%25}"
+            value="${value//$'\r'/%0D}"
+            printf '%s' "${value//$'\n'/%0A}"
+          }
+
+          escape_property() {
+            local value
+            value="$(escape_message "$1")"
+            value="${value//,/%2C}"
+            printf '%s' "${value//:/%3A}"
+          }
+
+          # go vet and staticcheck both write file:line:col: message, with the
+          # path relative to the module. An annotation is resolved against the
+          # repository root, so a nested module needs its prefix back or the
+          # annotation points at a file that does not exist and never appears
+          # on the pull request.
+          annotate() {
+            local line prefix=""
+            if [[ "${WORKING_DIRECTORY}" != "." ]]; then
+              prefix="${WORKING_DIRECTORY%/}/"
+            fi
+            while IFS= read -r line; do
+              if [[ "${line}" =~ ^([^[:space:]]+\.go):([0-9]+):([0-9]+):[[:space:]](.*)$ ]]; then
+                printf '::error file=%s,line=%s,col=%s::%s\n' \
+                  "$(escape_property "${prefix}${BASH_REMATCH[1]#./}")" \
+                  "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" \
+                  "$(escape_message "${BASH_REMATCH[4]}")"
+              fi
+            done < "$1"
+          }
+
+          args=(-f text)
+          if [[ -n "${BUILD_TAGS}" ]]; then
+            args+=("-tags=${BUILD_TAGS}")
+          fi
+          read -ra pkgs <<< "${PACKAGES}"
+
+          status=0
+          go run "honnef.co/go/tools/cmd/staticcheck@${STATICCHECK_VERSION}" \
+            "${args[@]}" "${pkgs[@]}" > "${RUNNER_TEMP}/staticcheck.txt" 2>&1 || status=$?
+          cat "${RUNNER_TEMP}/staticcheck.txt"
+
+          annotate "${RUNNER_TEMP}/staticcheck.txt"
+
+          findings="$(grep -cE '^[^ :]+\.go:[0-9]+:[0-9]+:' "${RUNNER_TEMP}/staticcheck.txt" || true)"
+          {
+            echo "### staticcheck ${STATICCHECK_VERSION}"
+            echo ""
+            echo "${findings} finding(s) in \`${PACKAGES}\`."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          exit "${status}"
+...
