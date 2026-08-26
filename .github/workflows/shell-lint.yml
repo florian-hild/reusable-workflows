@@ -66,9 +66,17 @@ jobs:
     name: shellcheck
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    concurrency:
-      group: ${{ github.workflow }}-shell-lint-${{ inputs.paths }}-${{ github.ref }}
-      cancel-in-progress: true
+    # No concurrency group here on purpose. It would key on the caller's
+    # workflow name and this workflow's inputs, so a caller that invokes this
+    # workflow twice - a second lint over a build-tagged package, a second test
+    # run over a different suite - lands both calls in one group and the later
+    # one cancels the earlier. That failure is silent: the cancelled job
+    # reports zero steps and no reason.
+    #
+    # Concurrency belongs to the caller, which knows how many times it calls
+    # this. Every caller in the house already sets it workflow-wide with
+    # cancel-in-progress on pull requests, which cancels these jobs along with
+    # the run that superseded them.
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
