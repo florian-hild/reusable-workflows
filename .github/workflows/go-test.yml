@@ -1,0 +1,299 @@
+---
+name: Go tests
+run-name: Go tests
+
+# go test over a Go module, plus the two checks that only ever fail after
+# somebody changed a dependency: that go.mod and go.sum are still what
+# `go mod tidy` would produce, and that the module still cross-compiles
+# statically for every platform it is deployed to.
+#
+# The race detector and the cross-compile are separate steps on purpose:
+# -race needs cgo, and the cross-compile is there to prove CGO_ENABLED=0 still
+# works. One step cannot do both.
+
+on:
+  workflow_call:
+    inputs:
+      working_directory:
+        description: "Directory containing go.mod."
+        required: false
+        type: string
+        default: "."
+      packages:
+        description: "Package pattern passed to go test."
+        required: false
+        type: string
+        default: "./..."
+      go_version_file:
+        description: "File the Go version is read from, relative to working_directory."
+        required: false
+        type: string
+        default: "go.mod"
+      race:
+        description: "Run the tests under the race detector."
+        required: false
+        type: boolean
+        default: true
+      coverage:
+        description: "Collect coverage and report the total in the job summary."
+        required: false
+        type: boolean
+        default: true
+      coverage_threshold:
+        description: >-
+          Minimum statement coverage in percent. 0 reports the number without
+          enforcing it, which is the honest default for a repository that has
+          not agreed on a target.
+        required: false
+        type: number
+        default: 0
+      build_tags:
+        description: "Comma-separated build tags, e.g. 'integration'."
+        required: false
+        type: string
+        default: ""
+      test_args:
+        description: "Additional arguments passed to go test, e.g. '-count=1'."
+        required: false
+        type: string
+        default: ""
+      check_tidy:
+        description: >-
+          Verify that go.mod and go.sum are what `go mod tidy` produces. A
+          stale go.sum means the tests ran against different dependencies than
+          a later build would use.
+        required: false
+        type: boolean
+        default: true
+      build_platforms:
+        description: >-
+          Comma-separated GOOS/GOARCH pairs that must build with CGO_ENABLED=0.
+          Empty skips the check.
+        required: false
+        type: string
+        default: "linux/amd64,linux/arm64"
+
+permissions:
+  contents: read
+
+jobs:
+  go-test:
+    name: go test
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    concurrency:
+      group: ${{ github.workflow }}-go-test-${{ inputs.working_directory }}-${{ github.ref }}
+      cancel-in-progress: true
+    defaults:
+      run:
+        working-directory: ${{ inputs.working_directory }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: ${{ inputs.working_directory }}/${{ inputs.go_version_file }}
+          cache-dependency-path: ${{ inputs.working_directory }}/go.sum
+
+      - name: Download dependencies
+        run: go mod download
+
+      # Before the tests: if the module graph is stale, everything below ran
+      # against dependencies that a release build would not use.
+      - name: Check that go.mod and go.sum are tidy
+        if: inputs.check_tidy
+        shell: bash
+        env:
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
+        run: |
+          set -euo pipefail
+
+          # A workflow command reads %, CR and LF as syntax, so anything that
+          # comes from a tool or an input has to be escaped before it goes in.
+          # Property values carry two more: a comma or a colon would end the
+          # property early and let the rest of a path inject further commands.
+          escape_message() {
+            local value="${1//%/%25}"
+            value="${value//$'\r'/%0D}"
+            printf '%s' "${value//$'\n'/%0A}"
+          }
+
+          escape_property() {
+            local value
+            value="$(escape_message "$1")"
+            value="${value//,/%2C}"
+            printf '%s' "${value//:/%3A}"
+          }
+
+          cp go.mod "${RUNNER_TEMP}/go.mod.orig"
+          had_sum=false
+          if [[ -f go.sum ]]; then
+            had_sum=true
+            cp go.sum "${RUNNER_TEMP}/go.sum.orig"
+          else
+            : > "${RUNNER_TEMP}/go.sum.orig"
+          fi
+
+          go mod tidy
+
+          # A module with no dependencies has no go.sum, and diff against a
+          # file that is not there is an error rather than a difference.
+          if [[ -f go.sum ]]; then
+            cp go.sum "${RUNNER_TEMP}/go.sum.tidied"
+          else
+            : > "${RUNNER_TEMP}/go.sum.tidied"
+          fi
+
+          status=0
+          diff -u "${RUNNER_TEMP}/go.mod.orig" go.mod > "${RUNNER_TEMP}/tidy.diff" || status=1
+          diff -u "${RUNNER_TEMP}/go.sum.orig" "${RUNNER_TEMP}/go.sum.tidied" \
+            >> "${RUNNER_TEMP}/tidy.diff" || status=1
+
+          # Put the tree back: the steps after this one must test what the
+          # repository actually contains, not what tidy would like it to.
+          cp "${RUNNER_TEMP}/go.mod.orig" go.mod
+          if [[ "${had_sum}" == "true" ]]; then
+            cp "${RUNNER_TEMP}/go.sum.orig" go.sum
+          else
+            rm -f go.sum
+          fi
+
+          if [[ "${status}" -eq 0 ]]; then
+            echo "go.mod and go.sum are tidy."
+            exit 0
+          fi
+
+          cat "${RUNNER_TEMP}/tidy.diff"
+          {
+            echo "### go mod tidy"
+            echo ""
+            echo "\`go.mod\` or \`go.sum\` is not tidy. Run \`go mod tidy\` locally."
+            echo ""
+            echo '```diff'
+            head -c 20000 "${RUNNER_TEMP}/tidy.diff"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          prefix=""
+          if [[ "${WORKING_DIRECTORY}" != "." ]]; then
+            prefix="${WORKING_DIRECTORY%/}/"
+          fi
+          printf '::error file=%s::not tidy, run go mod tidy\n' \
+            "$(escape_property "${prefix}go.mod")"
+          exit 1
+
+      - name: Run go test
+        shell: bash
+        env:
+          BUILD_TAGS: ${{ inputs.build_tags }}
+          COVERAGE: ${{ inputs.coverage }}
+          PACKAGES: ${{ inputs.packages }}
+          RACE: ${{ inputs.race }}
+          TEST_ARGS: ${{ inputs.test_args }}
+        run: |
+          set -euo pipefail
+
+          args=()
+          if [[ -n "${BUILD_TAGS}" ]]; then
+            args+=("-tags=${BUILD_TAGS}")
+          fi
+          if [[ "${RACE}" == "true" ]]; then
+            args+=(-race)
+          fi
+          if [[ "${COVERAGE}" == "true" ]]; then
+            args+=("-coverprofile=${RUNNER_TEMP}/coverage.out" -covermode=atomic)
+          fi
+          read -ra extra <<< "${TEST_ARGS}"
+          read -ra pkgs <<< "${PACKAGES}"
+
+          go test "${args[@]}" "${extra[@]}" "${pkgs[@]}"
+
+      - name: Report coverage
+        if: ${{ !cancelled() && inputs.coverage }}
+        shell: bash
+        env:
+          THRESHOLD: ${{ inputs.coverage_threshold }}
+        run: |
+          set -euo pipefail
+
+          # A workflow command reads %, CR and LF as syntax, so anything that
+          # comes from a tool or an input has to be escaped before it goes in.
+          # Property values carry two more: a comma or a colon would end the
+          # property early and let the rest of a path inject further commands.
+          escape_message() {
+            local value="${1//%/%25}"
+            value="${value//$'\r'/%0D}"
+            printf '%s' "${value//$'\n'/%0A}"
+          }
+
+          escape_property() {
+            local value
+            value="$(escape_message "$1")"
+            value="${value//,/%2C}"
+            printf '%s' "${value//:/%3A}"
+          }
+
+          if [[ ! -s "${RUNNER_TEMP}/coverage.out" ]]; then
+            echo "::warning::no coverage profile was written"
+            exit 0
+          fi
+
+          go tool cover -func="${RUNNER_TEMP}/coverage.out" > "${RUNNER_TEMP}/coverage.txt"
+          total="$(awk '/^total:/ { gsub(/%/, "", $3); print $3 }' "${RUNNER_TEMP}/coverage.txt")"
+
+          {
+            echo "### Coverage"
+            echo ""
+            echo "Total: **${total}%** (threshold ${THRESHOLD}%)"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          echo "Total coverage: ${total}%"
+
+          if awk -v t="${total}" -v m="${THRESHOLD}" 'BEGIN { exit !(m > 0 && t < m) }'; then
+            printf '::error::%s\n' \
+              "$(escape_message "coverage ${total}% is below the threshold of ${THRESHOLD}%")"
+            exit 1
+          fi
+
+      # A dependency that pulls in cgo builds fine on the runner and then does
+      # not build for the host it is deployed to. This is where that is caught.
+      - name: Check the static cross-compile
+        if: ${{ !cancelled() && inputs.build_platforms != '' }}
+        shell: bash
+        env:
+          BUILD_PLATFORMS: ${{ inputs.build_platforms }}
+          BUILD_TAGS: ${{ inputs.build_tags }}
+          PACKAGES: ${{ inputs.packages }}
+        run: |
+          set -euo pipefail
+
+          args=()
+          if [[ -n "${BUILD_TAGS}" ]]; then
+            args+=("-tags=${BUILD_TAGS}")
+          fi
+          read -ra pkgs <<< "${PACKAGES}"
+
+          # -o into a directory, not /dev/null: a pattern that matches more
+          # than one package cannot be written to a single file, and ./... in
+          # any real module matches many.
+          outdir="${RUNNER_TEMP}/crossbuild"
+
+          IFS=',' read -ra platforms <<< "${BUILD_PLATFORMS}"
+          for platform in "${platforms[@]}"; do
+            platform="${platform// /}"
+            [[ -n "${platform}" ]] || continue
+            goos="${platform%%/*}"
+            goarch="${platform##*/}"
+
+            echo "Building for ${goos}/${goarch}"
+            rm -rf "${outdir}"
+            mkdir -p "${outdir}"
+            GOOS="${goos}" GOARCH="${goarch}" CGO_ENABLED=0 \
+              go build "${args[@]}" -o "${outdir}/" "${pkgs[@]}"
+          done
+          rm -rf "${outdir}"
+...
