@@ -10,6 +10,9 @@ run-name: Go release
 # simpler and no less secure outside a container than inside one with the
 # socket mounted in.
 #
+# It declares no permissions of its own; see the note on the job below for
+# what the calling job has to grant.
+#
 # It does not compute a version and does not push a tag: it is handed both, so
 # that a repository releasing an image and a binary together publishes one
 # version, not two that drift. The caller either passes container-build.yml's
@@ -79,8 +82,8 @@ on:
         description: >-
           Publish a signed build provenance attestation for every binary, so a
           downloader can prove with `gh attestation verify` which workflow and
-          which commit produced the file. Requires the caller to grant
-          id-token: write and attestations: write.
+          which commit produced the file. On means the calling job must grant
+          id-token: write and attestations: write on top of contents: write.
         required: false
         type: boolean
         default: true
@@ -95,8 +98,10 @@ on:
         type: boolean
         default: true
 
-permissions:
-  contents: read
+# No permissions key here either, and this is the one place in the repository
+# where the house default of "contents: read" would be actively wrong: it is
+# the workflow-level default for the job below, so the job would inherit read
+# and gh release create would 403.
 
 jobs:
   go-release:
@@ -104,10 +109,21 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 20
     if: ${{ inputs.version != '' }}
-    permissions:
-      contents: write # create the release and upload assets
-      id-token: write # sign the provenance attestation
-      attestations: write # store it
+    # No permissions block on purpose, so the job inherits the calling job's.
+    #
+    # A called workflow can only narrow what the caller granted - asking for
+    # more fails the run before a single step executes. Declaring id-token and
+    # attestations here would therefore force every caller to grant both even
+    # with attestations off, since `permissions` takes no expressions and the
+    # block cannot be made conditional. The input would be a choice in name
+    # only.
+    #
+    # What the calling job must grant:
+    #   contents: write                       always, to create the release
+    #   id-token: write, attestations: write  additionally, for attestations
+    #
+    # The cost is that this job no longer drops anything the caller granted
+    # more broadly. Grant permissions on the calling job, not workflow-wide.
     # Never cancelled: a half-uploaded release is worse than a slow one, and
     # two runs would race for the same tag.
     concurrency:
