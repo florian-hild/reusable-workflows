@@ -86,6 +86,14 @@ jobs:
         run: |
           set -euo pipefail
 
+          # A workflow command reads %, CR and LF as syntax, so anything that
+          # comes from an input or a tool has to be escaped before it goes in.
+          escape_message() {
+            local value="${1//%/%25}"
+            value="${value//$'\r'/%0D}"
+            printf '%s' "${value//$'\n'/%0A}"
+          }
+
           read -ra pathspecs <<< "${PATHS}"
           read -ra excludes <<< "${EXCLUDE_PATHS}"
           for exclude in "${excludes[@]}"; do
@@ -116,7 +124,7 @@ jobs:
           echo "count=${#files[@]}" >> "${GITHUB_OUTPUT}"
 
           if [[ "${#files[@]}" -eq 0 ]]; then
-            echo "::warning::No shell scripts found under '${PATHS}'"
+            echo "::warning::No shell scripts found under '$(escape_message "${PATHS}")'"
             exit 0
           fi
 
@@ -175,11 +183,16 @@ jobs:
           jq -r '.comments[]
             | "\(.file):\(.line):\(.column): \(.level): \(.message) [SC\(.code)]"' "${REPORT}"
 
-          jq -r '.comments[]
+          # A path with a comma or a message spanning lines would otherwise end
+          # the command early, so both are escaped the way GitHub expects.
+          jq -r '
+            def escape: tostring | gsub("%"; "%25") | gsub("\r"; "%0D") | gsub("\n"; "%0A");
+            def escape_property: escape | gsub(","; "%2C") | gsub(":"; "%3A");
+            .comments[]
             | (if .level == "error" then "error"
                elif .level == "warning" then "warning"
                else "notice" end) as $level
-            | "::\($level) file=\(.file),line=\(.line),col=\(.column),title=SC\(.code)::\(.message)"' "${REPORT}"
+            | "::\($level) file=\(.file | escape_property),line=\(.line),col=\(.column),title=SC\(.code)::\(.message | escape)"' "${REPORT}"
 
           findings="$(jq '.comments | length' "${REPORT}")"
           {
@@ -209,9 +222,17 @@ jobs:
           status=0
           shfmt --diff "${flags[@]}" -- "${files[@]}" > "${DIFF}" || status=$?
 
+          # shfmt exits non-zero both for a difference and for a failure it
+          # cannot format at all - a parse error or an unreadable file. Those
+          # write nothing to stdout, so an empty diff plus a non-zero exit is
+          # the failure case, and the reason is on stderr above.
           if [[ ! -s "${DIFF}" ]]; then
+            if [[ "${status}" -ne 0 ]]; then
+              echo "::error::shfmt failed (exit ${status}), see the log above"
+              exit "${status}"
+            fi
             echo "All files are formatted."
-            exit "${status}"
+            exit 0
           fi
 
           cat "${DIFF}"
