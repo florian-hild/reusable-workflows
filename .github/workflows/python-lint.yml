@@ -34,15 +34,19 @@ jobs:
     timeout-minutes: 10
     # No concurrency group here on purpose. It would key on the caller's
     # workflow name and this workflow's inputs, so a caller that invokes this
-    # workflow twice - a second lint over a build-tagged package, a second test
-    # run over a different suite - lands both calls in one group and the later
-    # one cancels the earlier. That failure is silent: the cancelled job
-    # reports zero steps and no reason.
+    # workflow twice - two package sets, two suites, two directories - lands
+    # both calls in one group and the later one cancels the earlier. That
+    # failure is silent: the cancelled job reports zero steps and no reason.
     #
-    # Concurrency belongs to the caller, which knows how many times it calls
-    # this. Every caller in the house already sets it workflow-wide with
-    # cancel-in-progress on pull requests, which cancels these jobs along with
-    # the run that superseded them.
+    # Concurrency is therefore the caller's to declare, and this is a real
+    # behavioural dependency rather than a convention: nothing here cancels a
+    # superseded run any more, so a caller that wants one cancelled has to say
+    # so itself, on the calling workflow, where it also knows how many times it
+    # invokes this one.
+    #
+    #   concurrency:
+    #     group: ${{ github.workflow }}-${{ github.ref }}
+    #     cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
     defaults:
       run:
         working-directory: ${{ inputs.working_directory }}
