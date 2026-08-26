@@ -1,0 +1,230 @@
+---
+name: Shell lint
+run-name: Shell lint
+
+# ShellCheck over the shell scripts of a repository, optionally with an shfmt
+# formatting check. Lint and format are separate switches so a project can
+# adopt the linter without reformatting its whole tree first.
+#
+# Scripts are discovered from the git index: every tracked file with a shell
+# extension, plus every tracked extensionless file with a shell shebang.
+# Untracked and ignored files are never linted.
+#
+# ShellCheck comes from the runner image, so its version is pinned by the
+# runner label rather than by this workflow. shfmt is installed from the
+# Ubuntu archive, and only when check_format is on.
+
+on:
+  workflow_call:
+    inputs:
+      paths:
+        description: "Space-separated files or directories to search for shell scripts."
+        required: false
+        type: string
+        default: "."
+      exclude_paths:
+        description: "Space-separated git pathspecs to skip, e.g. 'vendor third_party/*'."
+        required: false
+        type: string
+        default: ""
+      shellcheck_severity:
+        description: "Lowest severity that is reported. One of 'style', 'info', 'warning', 'error'."
+        required: false
+        type: string
+        default: "style"
+      shellcheck_exclude:
+        description: "Comma-separated ShellCheck codes to ignore, e.g. 'SC1091,SC2312'."
+        required: false
+        type: string
+        default: ""
+      shellcheck_shell:
+        description: "Force a dialect instead of reading the shebang. One of 'sh', 'bash', 'dash', 'ksh'. Empty keeps the shebang."
+        required: false
+        type: string
+        default: ""
+      follow_sources:
+        description: "Follow `source`d files (ShellCheck -x). Off by default because it turns an unresolvable include into a finding."
+        required: false
+        type: boolean
+        default: false
+      check_format:
+        description: "Also run `shfmt --diff`."
+        required: false
+        type: boolean
+        default: false
+      shfmt_flags:
+        description: "Formatting flags for shfmt, e.g. '-i 2 -ci -sr'. Empty makes shfmt read .editorconfig."
+        required: false
+        type: string
+        default: ""
+
+permissions:
+  contents: read
+
+jobs:
+  shell-lint:
+    name: shellcheck
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    concurrency:
+      group: ${{ github.workflow }}-shell-lint-${{ inputs.paths }}-${{ github.ref }}
+      cancel-in-progress: true
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      # Both tools need an explicit file list, so discovery happens once here.
+      # The list is written NUL-separated to keep every path intact.
+      - name: Find shell scripts
+        id: find
+        shell: bash
+        env:
+          EXCLUDE_PATHS: ${{ inputs.exclude_paths }}
+          PATHS: ${{ inputs.paths }}
+        run: |
+          set -euo pipefail
+
+          read -ra pathspecs <<< "${PATHS}"
+          read -ra excludes <<< "${EXCLUDE_PATHS}"
+          for exclude in "${excludes[@]}"; do
+            pathspecs+=(":(exclude)${exclude}")
+          done
+
+          mapfile -d '' -t candidates < <(git ls-files -z -- "${pathspecs[@]}")
+
+          files=()
+          for candidate in "${candidates[@]}"; do
+            [[ -f "${candidate}" ]] || continue # submodule, or a dangling symlink
+
+            case "${candidate##*/}" in
+              *.sh | *.bash | *.ksh | *.dash)
+                files+=("${candidate}")
+                continue
+                ;;
+              *.*) continue ;; # any other extension, .zsh and .fish included
+            esac
+
+            # No extension: decide on the shebang.
+            read -r shebang < "${candidate}" || continue
+            if [[ "${shebang}" =~ ^#!.*[/[:space:]](sh|bash|ksh|dash)([[:space:]]|$) ]]; then
+              files+=("${candidate}")
+            fi
+          done
+
+          echo "count=${#files[@]}" >> "${GITHUB_OUTPUT}"
+
+          if [[ "${#files[@]}" -eq 0 ]]; then
+            echo "::warning::No shell scripts found under '${PATHS}'"
+            exit 0
+          fi
+
+          printf '%s\0' "${files[@]}" > "${RUNNER_TEMP}/shell-files"
+
+          echo "Linting ${#files[@]} file(s):"
+          printf '  %s\n' "${files[@]}"
+
+      - name: Install shfmt
+        if: inputs.check_format && steps.find.outputs.count != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends --yes shfmt
+
+      # json1 instead of the default output: it carries the code and the
+      # severity of every finding, so a single run yields both readable log
+      # lines and inline annotations on the pull request.
+      - name: Run shellcheck
+        if: steps.find.outputs.count != '0'
+        shell: bash
+        env:
+          EXCLUDE: ${{ inputs.shellcheck_exclude }}
+          FOLLOW_SOURCES: ${{ inputs.follow_sources }}
+          REPORT: ${{ runner.temp }}/shellcheck.json
+          SEVERITY: ${{ inputs.shellcheck_severity }}
+          SHELL_DIALECT: ${{ inputs.shellcheck_shell }}
+        run: |
+          set -euo pipefail
+
+          args=(--format=json1 "--severity=${SEVERITY}")
+          if [[ -n "${EXCLUDE}" ]]; then
+            args+=("--exclude=${EXCLUDE}")
+          fi
+          if [[ -n "${SHELL_DIALECT}" ]]; then
+            args+=("--shell=${SHELL_DIALECT}")
+          fi
+          if [[ "${FOLLOW_SOURCES}" == "true" ]]; then
+            args+=(-x)
+          fi
+
+          mapfile -d '' -t files < "${RUNNER_TEMP}/shell-files"
+
+          shellcheck --version
+
+          # ShellCheck exits 1 on findings, the report is rendered either way.
+          status=0
+          shellcheck "${args[@]}" -- "${files[@]}" > "${REPORT}" || status=$?
+
+          if [[ ! -s "${REPORT}" ]]; then
+            echo "::error::shellcheck wrote no report (exit ${status})"
+            exit 1
+          fi
+
+          jq -r '.comments[]
+            | "\(.file):\(.line):\(.column): \(.level): \(.message) [SC\(.code)]"' "${REPORT}"
+
+          jq -r '.comments[]
+            | (if .level == "error" then "error"
+               elif .level == "warning" then "warning"
+               else "notice" end) as $level
+            | "::\($level) file=\(.file),line=\(.line),col=\(.column),title=SC\(.code)::\(.message)"' "${REPORT}"
+
+          findings="$(jq '.comments | length' "${REPORT}")"
+          {
+            echo "### ShellCheck"
+            echo ""
+            echo "${findings} finding(s) in ${#files[@]} file(s), severity \`${SEVERITY}\` and above."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          exit "${status}"
+
+      # Runs even when shellcheck failed, so one push surfaces both kinds of
+      # problem instead of only the first.
+      - name: Run shfmt --diff
+        if: ${{ !cancelled() && inputs.check_format && steps.find.outputs.count != '0' }}
+        shell: bash
+        env:
+          DIFF: ${{ runner.temp }}/shfmt.diff
+          SHFMT_FLAGS: ${{ inputs.shfmt_flags }}
+        run: |
+          set -euo pipefail
+
+          read -ra flags <<< "${SHFMT_FLAGS}"
+          mapfile -d '' -t files < "${RUNNER_TEMP}/shell-files"
+
+          shfmt --version
+
+          status=0
+          shfmt --diff "${flags[@]}" -- "${files[@]}" > "${DIFF}" || status=$?
+
+          if [[ ! -s "${DIFF}" ]]; then
+            echo "All files are formatted."
+            exit "${status}"
+          fi
+
+          cat "${DIFF}"
+
+          {
+            echo "### shfmt"
+            echo ""
+            echo "These files are not formatted. Run \`shfmt --write ${SHFMT_FLAGS}\` locally."
+            echo ""
+            echo '```diff'
+            head -c 100000 "${DIFF}"
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          echo "::error::shfmt reported formatting differences, see the job summary"
+          exit 1
