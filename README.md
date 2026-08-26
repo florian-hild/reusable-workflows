@@ -6,6 +6,10 @@ Reusable GitHub Actions workflows.
 |---|---|
 | [`python-lint.yml`](.github/workflows/python-lint.yml) | Ruff over a uv-managed project |
 | [`python-test.yml`](.github/workflows/python-test.yml) | pytest, plus a check that `uv.lock` is current |
+| [`shell-lint.yml`](.github/workflows/shell-lint.yml) | ShellCheck over the shell scripts of a repository, optionally `shfmt` |
+| [`go-lint.yml`](.github/workflows/go-lint.yml) | gofmt, `go vet` and staticcheck over a Go module |
+| [`go-test.yml`](.github/workflows/go-test.yml) | `go test`, plus a `go mod tidy` check and a static cross-compile |
+| [`go-release.yml`](.github/workflows/go-release.yml) | Build static Go binaries and attach them to a GitHub release |
 | [`container-build.yml`](.github/workflows/container-build.yml) | Build, push and tag a container image |
 | [`container-deploy.yml`](.github/workflows/container-deploy.yml) | Deploy a compose project onto a self-hosted runner |
 | [`security-scan.yml`](.github/workflows/security-scan.yml) | Trivy scan of a filesystem, repository or image |
