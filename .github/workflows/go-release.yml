@@ -43,8 +43,8 @@ on:
       binary_name:
         description: >-
           Base name of the published artifacts. Each becomes
-          <binary_name>_<goos>_<goarch>. Empty uses the name Go gives the
-          binary, which is the last element of main_package.
+          <binary_name>_<version>_<goos>_<goarch>. Empty uses the name Go gives
+          the binary, which is the last element of main_package.
         required: false
         type: string
         default: ""
@@ -227,7 +227,11 @@ jobs:
             if [[ -z "${name}" ]]; then
               name="$(basename "${built[0]}")"
             fi
-            mv "${built[0]}" "${dist}/${name}_${goos}_${goarch}"
+            # The version is in the file name, not only in the release it
+            # hangs under: a binary that has been downloaded, copied to a host
+            # or attached to a ticket has lost that context, and identifying
+            # it should not require running it.
+            mv "${built[0]}" "${dist}/${name}_${VERSION}_${goos}_${goarch}"
           done
 
           if [[ -z "$(ls -A "${dist}")" ]]; then
