@@ -178,7 +178,14 @@ jobs:
             GOOS="${goos}" GOARCH="${goarch}" CGO_ENABLED=0 \
               go build "${args[@]}" -o "${stage}/" "${pkgs[@]}"
 
+            # nullglob, or an empty directory yields the unexpanded pattern
+            # as a single element and the guard below sees one "binary". That
+            # happens whenever main_package matches only non-main packages:
+            # go build succeeds and writes nothing.
+            shopt -s nullglob
             built=("${stage}"/*)
+            shopt -u nullglob
+
             if [[ "${#built[@]}" -ne 1 ]]; then
               printf '::error::%s\n' \
                 "$(escape_message "main_package '${MAIN_PACKAGE}' produced ${#built[@]} binaries; name exactly one")"

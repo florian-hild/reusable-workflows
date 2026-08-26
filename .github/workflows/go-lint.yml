@@ -143,6 +143,7 @@ jobs:
         env:
           BUILD_TAGS: ${{ inputs.build_tags }}
           PACKAGES: ${{ inputs.packages }}
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
         run: |
           set -euo pipefail
 
@@ -163,13 +164,20 @@ jobs:
             printf '%s' "${value//:/%3A}"
           }
 
-          # go vet and staticcheck both write file:line:col: message.
+          # go vet and staticcheck both write file:line:col: message, with the
+          # path relative to the module. An annotation is resolved against the
+          # repository root, so a nested module needs its prefix back or the
+          # annotation points at a file that does not exist and never appears
+          # on the pull request.
           annotate() {
-            local line
+            local line prefix=""
+            if [[ "${WORKING_DIRECTORY}" != "." ]]; then
+              prefix="${WORKING_DIRECTORY%/}/"
+            fi
             while IFS= read -r line; do
               if [[ "${line}" =~ ^([^[:space:]]+\.go):([0-9]+):([0-9]+):[[:space:]](.*)$ ]]; then
                 printf '::error file=%s,line=%s,col=%s::%s\n' \
-                  "$(escape_property "${BASH_REMATCH[1]}")" \
+                  "$(escape_property "${prefix}${BASH_REMATCH[1]#./}")" \
                   "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" \
                   "$(escape_message "${BASH_REMATCH[4]}")"
               fi
@@ -200,6 +208,7 @@ jobs:
           BUILD_TAGS: ${{ inputs.build_tags }}
           PACKAGES: ${{ inputs.packages }}
           STATICCHECK_VERSION: ${{ inputs.staticcheck_version }}
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
         run: |
           set -euo pipefail
 
@@ -220,13 +229,20 @@ jobs:
             printf '%s' "${value//:/%3A}"
           }
 
-          # go vet and staticcheck both write file:line:col: message.
+          # go vet and staticcheck both write file:line:col: message, with the
+          # path relative to the module. An annotation is resolved against the
+          # repository root, so a nested module needs its prefix back or the
+          # annotation points at a file that does not exist and never appears
+          # on the pull request.
           annotate() {
-            local line
+            local line prefix=""
+            if [[ "${WORKING_DIRECTORY}" != "." ]]; then
+              prefix="${WORKING_DIRECTORY%/}/"
+            fi
             while IFS= read -r line; do
               if [[ "${line}" =~ ^([^[:space:]]+\.go):([0-9]+):([0-9]+):[[:space:]](.*)$ ]]; then
                 printf '::error file=%s,line=%s,col=%s::%s\n' \
-                  "$(escape_property "${BASH_REMATCH[1]}")" \
+                  "$(escape_property "${prefix}${BASH_REMATCH[1]#./}")" \
                   "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" \
                   "$(escape_message "${BASH_REMATCH[4]}")"
               fi
