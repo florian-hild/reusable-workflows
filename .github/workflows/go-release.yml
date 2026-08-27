@@ -180,6 +180,22 @@ jobs:
             printf '%s' "${value//:/%3A}"
           }
 
+          # The version becomes part of every asset's file name, so it has to
+          # be a file name. A tag component may contain a slash - refs/tags/
+          # 1.2.3/rc1 is valid - and that would silently turn dist/<name>_
+          # 1.2.3/rc1_linux_amd64 into a path under a directory that does not
+          # exist. Checking it here costs nothing and fails in seconds; the
+          # alternative is an unexplained "No such file or directory" from mv
+          # after both platforms have been cross-compiled.
+          #
+          # The set is what SemVer 2.0.0 allows plus nothing: alphanumerics,
+          # dot, hyphen, underscore and the plus of a build-metadata suffix.
+          if [[ -z "${VERSION}" || ! "${VERSION}" =~ ^[A-Za-z0-9._+-]+$ ]]; then
+            printf '::error::%s\n' \
+              "$(escape_message "version '${VERSION}' cannot be part of a file name; use only letters, digits, '.', '-', '_' and '+'")"
+            exit 1
+          fi
+
           ldflags="-s -w"
           if [[ -n "${LDFLAGS_VERSION_VAR}" ]]; then
             ldflags+=" -X ${LDFLAGS_VERSION_VAR}=${VERSION}"
