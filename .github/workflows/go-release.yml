@@ -88,12 +88,18 @@ on:
         type: boolean
         default: true
       checksums:
-        description: "Publish a SHA256SUMS file alongside the binaries."
+        description: >-
+          Publish checksums alongside the binaries: one SHA256SUMS covering
+          everything, plus a `<binary>.sha256` per file so a host can verify
+          only the architecture it downloaded.
         required: false
         type: boolean
         default: true
       generate_notes:
-        description: "Let GitHub generate the release notes from the commits."
+        description: >-
+          List the commits since the previous tag of this app in the release
+          notes, restricted to `working_directory` so a monorepo release does
+          not report another app's changes.
         required: false
         type: boolean
         default: true
@@ -270,13 +276,23 @@ jobs:
       # built it, from which commit, in which workflow run - which is the
       # question that matters for a binary that lands in /usr/local/bin on a
       # host with the docker socket.
+      #
+      # The checksum files are written after this on purpose, so dist/ still
+      # holds nothing but the binaries when the subjects are taken.
       - name: Attest build provenance
         if: inputs.attestations
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
           subject-path: ${{ steps.build.outputs.dist }}/*
 
-      - name: Write SHA256SUMS
+      # Both forms, because they answer different questions. SHA256SUMS checks
+      # everything that was published in one command; a per-binary .sha256 lets
+      # a host that only needs its own architecture verify without downloading
+      # the other one - which is the normal case for an install script.
+      #
+      # Both carry `<hash>  <basename>`, the format sha256sum -c reads, so
+      # either can be checked from the directory the files were downloaded to.
+      - name: Write checksums
         if: inputs.checksums
         shell: bash
         env:
@@ -284,7 +300,23 @@ jobs:
         run: |
           set -euo pipefail
           cd "${DIST}"
-          sha256sum -- * > SHA256SUMS
+
+          # Snapshot the list first: the loop writes into the same directory it
+          # reads, and a glob expanded live would start checksumming the
+          # .sha256 files it just created.
+          shopt -s nullglob
+          artifacts=(*)
+          shopt -u nullglob
+          if [[ "${#artifacts[@]}" -eq 0 ]]; then
+            printf '::error::%s\n' "nothing to checksum in ${DIST}"
+            exit 1
+          fi
+
+          sha256sum -- "${artifacts[@]}" > SHA256SUMS
+          for f in "${artifacts[@]}"; do
+            sha256sum -- "$f" > "${f}.sha256"
+          done
+
           cat SHA256SUMS
 
       # gh release create rather than an action: it is on every runner, it is
@@ -300,6 +332,7 @@ jobs:
           PLATFORMS: ${{ inputs.platforms }}
           TAG: ${{ inputs.tag_prefix }}${{ inputs.version }}
           TAG_PREFIX: ${{ inputs.tag_prefix }}
+          WORKING_DIRECTORY: ${{ inputs.working_directory }}
         run: |
           set -euo pipefail
 
@@ -330,25 +363,48 @@ jobs:
           : > "${notes}"
 
           # The notes are assembled here rather than left to
-          # `gh release create --generate-notes`, for two reasons. Appending
-          # to them is only possible if we hold them, and the API needs to be
-          # told where the previous release ended: its default is the newest
-          # release in the repository, which in a monorepo is whichever app
-          # published last, so the notes would list another app's commits.
+          # `gh release create --generate-notes`, and the log is read from git
+          # rather than from the API, because both of the API's answers are
+          # wrong in a monorepo.
+          #
+          # Its range is wrong: the default previous release is the newest one
+          # in the repository, which is whichever app published last. That is
+          # fixed by naming the previous tag with this app's own prefix.
+          #
+          # Its contents are wrong even then: every commit in that range is
+          # listed, and in a monorepo most of them belong to other apps. A
+          # release of one app has no business listing another's dependency
+          # bumps. git log takes a pathspec; the API does not.
           if [[ "${GENERATE_NOTES}" == "true" ]]; then
             prev="$(git tag --list "${TAG_PREFIX}*" --sort=-v:refname \
               | grep -vFx "${TAG}" | head -n 1 || true)"
-            fields=(-f "tag_name=${TAG}")
             if [[ -n "${prev}" ]]; then
-              echo "Generating notes since ${prev}."
-              fields+=(-f "previous_tag_name=${prev}")
+              echo "Listing commits under ${WORKING_DIRECTORY} since ${prev}."
+              range="${prev}..${TAG}"
             else
-              echo "No earlier ${TAG_PREFIX} tag; letting GitHub pick the range."
+              echo "No earlier ${TAG_PREFIX} tag; listing every commit under ${WORKING_DIRECTORY}."
+              range="${TAG}"
             fi
-            gh api --method POST \
-              "repos/${GITHUB_REPOSITORY}/releases/generate-notes" \
-              "${fields[@]}" --jq .body >> "${notes}"
-            printf '\n' >> "${notes}"
+
+            # --no-merges: a merge commit's subject names a branch, not a
+            # change, and the commits it brought in are in the range anyway.
+            log="$(git log --no-merges \
+              --pretty=format:"- %s ([\`%h\`](${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}/commit/%H))" \
+              "${range}" -- "${WORKING_DIRECTORY}")"
+
+            {
+              echo "## Changes"
+              echo ""
+              if [[ -n "${log}" ]]; then
+                echo "${log}"
+              else
+                # Reachable: a version can be forced with bump_version even
+                # when nothing under the path moved. Saying so beats an empty
+                # heading that reads like the list failed to render.
+                echo "_No commit touched \`${WORKING_DIRECTORY}\` since ${prev:-the start of history}._"
+              fi
+              echo ""
+            } >> "${notes}"
           fi
 
           # What the commits alone do not say: which tree these exact bytes
@@ -372,6 +428,10 @@ jobs:
             echo "Verify a download:"
             echo ""
             echo '```bash'
+            echo "# one file, without downloading the rest"
+            echo "sha256sum -c <file>.sha256"
+            echo ""
+            echo "# or everything that was downloaded"
             echo "sha256sum --ignore-missing -c SHA256SUMS"
             if [[ "${ATTESTATIONS}" == "true" ]]; then
               printf 'gh attestation verify <file> --repo %s\n' "${GITHUB_REPOSITORY}"
