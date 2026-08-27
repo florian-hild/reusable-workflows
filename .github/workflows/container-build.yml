@@ -142,7 +142,7 @@ jobs:
 
       - name: Determine next version
         id: get-version
-        uses: florian-hild/actions/next-version@v2
+        uses: florian-hild/actions/next-version@cf8cd806ce4756e4f6024ce699ea2b3430c556e8 # v2
         with:
           tag_pattern: ${{ inputs.tag_prefix }}
           change_path: ${{ inputs.change_path }}
@@ -287,7 +287,7 @@ jobs:
       # Last, so a failed build or smoke test leaves no version tagged.
       - name: Publish git tags
         if: ${{ steps.get-version.outputs.version != '' && inputs.publish_tags }}
-        uses: florian-hild/actions/release-tags@v2
+        uses: florian-hild/actions/release-tags@cf8cd806ce4756e4f6024ce699ea2b3430c556e8 # v2
         with:
           version: ${{ steps.get-version.outputs.version }}
           tag_prefix: ${{ inputs.tag_prefix }}
