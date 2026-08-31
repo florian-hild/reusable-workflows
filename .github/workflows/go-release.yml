@@ -89,9 +89,7 @@ on:
         default: true
       checksums:
         description: >-
-          Publish checksums alongside the binaries: one SHA256SUMS covering
-          everything, plus a `<binary>.sha256` per file so a host can verify
-          only the architecture it downloaded.
+          Publish checksums alongside the binaries.
         required: false
         type: boolean
         default: true
@@ -268,15 +266,6 @@ jobs:
           } >> "${GITHUB_OUTPUT}"
           ls -l "${dist}"
 
-      # Before SHA256SUMS is written, so dist/ still holds nothing but the
-      # binaries. A checksum file is not a build artifact and attesting it
-      # would only add a subject nobody verifies.
-      #
-      # SHA256SUMS says the file was not corrupted in transit. This says who
-      # built it, from which commit, in which workflow run - which is the
-      # question that matters for a binary that lands in /usr/local/bin on a
-      # host with the docker socket.
-      #
       # The checksum files are written after this on purpose, so dist/ still
       # holds nothing but the binaries when the subjects are taken.
       - name: Attest build provenance
@@ -285,13 +274,6 @@ jobs:
         with:
           subject-path: ${{ steps.build.outputs.dist }}/*
 
-      # Both forms, because they answer different questions. SHA256SUMS checks
-      # everything that was published in one command; a per-binary .sha256 lets
-      # a host that only needs its own architecture verify without downloading
-      # the other one - which is the normal case for an install script.
-      #
-      # Both carry `<hash>  <basename>`, the format sha256sum -c reads, so
-      # either can be checked from the directory the files were downloaded to.
       - name: Write checksums
         if: inputs.checksums
         shell: bash
@@ -312,12 +294,9 @@ jobs:
             exit 1
           fi
 
-          sha256sum -- "${artifacts[@]}" > SHA256SUMS
           for f in "${artifacts[@]}"; do
             sha256sum -- "$f" > "${f}.sha256"
           done
-
-          cat SHA256SUMS
 
       # gh release create rather than an action: it is on every runner, it is
       # what an operator would type, and it needs no third-party pin.
@@ -431,8 +410,6 @@ jobs:
             echo "# one file, without downloading the rest"
             echo "sha256sum -c <file>.sha256"
             echo ""
-            echo "# or everything that was downloaded"
-            echo "sha256sum --ignore-missing -c SHA256SUMS"
             if [[ "${ATTESTATIONS}" == "true" ]]; then
               printf 'gh attestation verify <file> --repo %s\n' "${GITHUB_REPOSITORY}"
             fi
