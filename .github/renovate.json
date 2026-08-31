@@ -2,28 +2,5 @@
     "$schema": "https://docs.renovatebot.com/renovate-schema.json",
     "extends": [
         "local>florian-hild/renovate-config"
-    ],
-    "timezone": "Europe/Berlin",
-    "rebaseWhen": "behind-base-branch",
-    "packageRules": [
-        {
-            "description": "Keep the SHA pin and the version comment in sync.",
-            "matchManagers": [
-                "github-actions"
-            ],
-            "pinDigests": true
-        },
-        {
-            "description": "Automerge patch/pin/digest updates once all checks pass and the release has aged; minor/major stay on manual review. Pre-1.0 packages are excluded (semver gives no patch-level stability guarantee there).",
-            "matchUpdateTypes": [
-                "patch",
-                "pin",
-                "digest"
-            ],
-            "matchCurrentVersion": "!/^0\\./",
-            "minimumReleaseAge": "5 days",
-            "automerge": true,
-            "automergeType": "pr"
-        }
     ]
 }
