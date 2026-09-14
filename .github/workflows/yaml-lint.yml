@@ -1,0 +1,162 @@
+---
+name: YAML lint
+run-name: YAML lint
+
+# yamllint over the YAML files of a repository. Catches both syntax errors
+# (a file that does not parse at all) and style issues (line length,
+# trailing spaces, duplicate keys, wrong indentation) depending on the
+# ruleset in effect.
+#
+# Files are discovered from the git index: every tracked file with a .yml or
+# .yaml extension. Untracked and ignored files are never linted.
+#
+# yamllint is installed from PyPI at a pinned version, so a run today and a
+# run in six months see the same rules.
+
+on:
+  workflow_call:
+    inputs:
+      paths:
+        description: "Space-separated files or directories to search for YAML files."
+        required: false
+        type: string
+        default: "."
+      exclude_paths:
+        description: "Space-separated git pathspecs to skip, e.g. 'vendor third_party/*'."
+        required: false
+        type: string
+        default: ""
+      config_file:
+        description: "Path to a yamllint config file, relative to the repository root. Empty uses the 'relaxed' built-in ruleset."
+        required: false
+        type: string
+        default: ""
+      strict:
+        description: "Fail on warnings too (yamllint --strict), not just errors."
+        required: false
+        type: boolean
+        default: false
+      yamllint_version:
+        description: "yamllint version to install from PyPI."
+        required: false
+        type: string
+        default: "1.37.1"
+
+permissions:
+  contents: read
+
+jobs:
+  yaml-lint:
+    name: yamllint
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # No concurrency group here on purpose. It would key on the caller's
+    # workflow name and this workflow's inputs, so a caller that invokes this
+    # workflow twice - two path sets, two suites - lands both calls in one
+    # group and the later one cancels the earlier. That failure is silent:
+    # the cancelled job reports zero steps and no reason.
+    #
+    # Concurrency is therefore the caller's to declare, and this is a real
+    # behavioural dependency rather than a convention: nothing here cancels a
+    # superseded run any more, so a caller that wants one cancelled has to say
+    # so itself, on the calling workflow, where it also knows how many times
+    # it invokes this one.
+    #
+    #   concurrency:
+    #     group: ${{ github.workflow }}-${{ github.ref }}
+    #     cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Find YAML files
+        id: find
+        shell: bash
+        env:
+          EXCLUDE_PATHS: ${{ inputs.exclude_paths }}
+          PATHS: ${{ inputs.paths }}
+        run: |
+          set -euo pipefail
+
+          read -ra pathspecs <<< "${PATHS}"
+          read -ra excludes <<< "${EXCLUDE_PATHS}"
+          for exclude in "${excludes[@]}"; do
+            pathspecs+=(":(exclude)${exclude}")
+          done
+
+          mapfile -d '' -t candidates < <(git ls-files -z -- "${pathspecs[@]}" '*.yml' '*.yaml')
+
+          files=()
+          for candidate in "${candidates[@]}"; do
+            [[ -f "${candidate}" ]] || continue # submodule, or a dangling symlink
+            files+=("${candidate}")
+          done
+
+          echo "count=${#files[@]}" >> "${GITHUB_OUTPUT}"
+
+          if [[ "${#files[@]}" -eq 0 ]]; then
+            echo "::warning::No YAML files found under '${PATHS}'"
+            exit 0
+          fi
+
+          printf '%s\0' "${files[@]}" > "${RUNNER_TEMP}/yaml-files"
+
+          echo "Linting ${#files[@]} file(s):"
+          printf '  %s\n' "${files[@]}"
+
+      - name: Set up Python
+        if: steps.find.outputs.count != '0'
+        uses: actions/setup-python@f5b04769690e1c07733a11e01ba32d4ec4de6e05 # v6.0.0
+        with:
+          python-version: "3.x"
+
+      - name: Install yamllint
+        if: steps.find.outputs.count != '0'
+        shell: bash
+        env:
+          YAMLLINT_VERSION: ${{ inputs.yamllint_version }}
+        run: pip install --disable-pip-version-check "yamllint==${YAMLLINT_VERSION}"
+
+      # -f github turns findings into inline annotations on the pull request
+      # instead of a wall of log output; yamllint still prints a plain-text
+      # copy to stdout for the job log.
+      - name: Run yamllint
+        if: steps.find.outputs.count != '0'
+        shell: bash
+        env:
+          CONFIG_FILE: ${{ inputs.config_file }}
+          STRICT: ${{ inputs.strict }}
+        run: |
+          set -euo pipefail
+
+          yamllint --version
+
+          args=()
+          if [[ -n "${CONFIG_FILE}" ]]; then
+            args+=(--config-file "${CONFIG_FILE}")
+          else
+            args+=(--config-data relaxed)
+          fi
+          if [[ "${STRICT}" == "true" ]]; then
+            args+=(--strict)
+          fi
+
+          mapfile -d '' -t files < "${RUNNER_TEMP}/yaml-files"
+
+          status=0
+          yamllint --format github "${args[@]}" -- "${files[@]}" || status=$?
+
+          {
+            echo "### yamllint"
+            echo ""
+            if [[ "${status}" -eq 0 ]]; then
+              echo "No issues found in ${#files[@]} file(s)."
+            else
+              echo "Issues found in ${#files[@]} file(s), see the annotations above."
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          exit "${status}"
+...
