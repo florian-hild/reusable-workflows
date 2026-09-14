@@ -78,12 +78,18 @@ jobs:
             pathspecs+=(":(exclude)${exclude}")
           done
 
-          mapfile -d '' -t candidates < <(git ls-files -z -- "${pathspecs[@]}" '*.json')
+          mapfile -d '' -t candidates < <(git ls-files -z -- "${pathspecs[@]}")
 
+          # Extension check happens here, not as another git pathspec:
+          # multiple pathspecs are OR'd together, so appending '*.json' next
+          # to the caller's own paths would match every file under "." (the
+          # default) instead of narrowing anything.
           files=()
           for candidate in "${candidates[@]}"; do
             [[ -f "${candidate}" ]] || continue # submodule, or a dangling symlink
-            files+=("${candidate}")
+            case "${candidate}" in
+              *.json) files+=("${candidate}") ;;
+            esac
           done
 
           echo "count=${#files[@]}" >> "${GITHUB_OUTPUT}"
