@@ -10,8 +10,8 @@ run-name: YAML lint
 # Files are discovered from the git index: every tracked file with a .yml or
 # .yaml extension. Untracked and ignored files are never linted.
 #
-# yamllint is installed from PyPI at a pinned version, so a run today and a
-# run in six months see the same rules.
+# yamllint runs via uv/uvx, either at a version the caller pins or, by
+# default, whatever uvx resolves as latest from PyPI at call time.
 
 on:
   workflow_call:
@@ -37,10 +37,10 @@ on:
         type: boolean
         default: false
       yamllint_version:
-        description: "yamllint version to install from PyPI."
+        description: "yamllint version to install from PyPI via uv, e.g. '1.37.1'. Empty runs whatever uvx resolves as latest at call time - rules can then change under an unpinned caller between two runs."
         required: false
         type: string
-        default: "1.37.1"
+        default: ""
 
 permissions:
   contents: read
@@ -106,32 +106,28 @@ jobs:
           echo "Linting ${#files[@]} file(s):"
           printf '  %s\n' "${files[@]}"
 
-      - name: Set up Python
+      - name: Install uv
         if: steps.find.outputs.count != '0'
-        uses: actions/setup-python@f5b04769690e1c07733a11e01ba32d4ec4de6e05 # v6.0.0
+        uses: astral-sh/setup-uv@bec219d24cd3e171d82865faccec33120bb574f4 # v10.1.0
         with:
-          python-version: "3.x"
+          enable-cache: true
 
-      - name: Install yamllint
-        if: steps.find.outputs.count != '0'
-        shell: bash
-        env:
-          YAMLLINT_VERSION: ${{ inputs.yamllint_version }}
-        run: pip install --disable-pip-version-check "yamllint==${YAMLLINT_VERSION}"
-
-      # -f github turns findings into inline annotations on the pull request
-      # instead of a wall of log output; yamllint still prints a plain-text
-      # copy to stdout for the job log.
+      # uvx runs yamllint from an ephemeral environment, at the version
+      # pinned above (or latest, if unset) - no venv to manage, no system
+      # Python to pollute.
       - name: Run yamllint
         if: steps.find.outputs.count != '0'
         shell: bash
         env:
           CONFIG_FILE: ${{ inputs.config_file }}
           STRICT: ${{ inputs.strict }}
+          YAMLLINT_VERSION: ${{ inputs.yamllint_version }}
         run: |
           set -euo pipefail
 
-          yamllint --version
+          yamllint=(uvx --from "yamllint${YAMLLINT_VERSION:+==${YAMLLINT_VERSION}}" yamllint)
+
+          "${yamllint[@]}" --version
 
           args=()
           if [[ -n "${CONFIG_FILE}" ]]; then
@@ -146,7 +142,7 @@ jobs:
           mapfile -d '' -t files < "${RUNNER_TEMP}/yaml-files"
 
           status=0
-          yamllint --format github "${args[@]}" -- "${files[@]}" || status=$?
+          "${yamllint[@]}" --format github "${args[@]}" -- "${files[@]}" || status=$?
 
           {
             echo "### yamllint"
