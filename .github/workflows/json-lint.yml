@@ -1,0 +1,168 @@
+---
+name: JSON lint
+run-name: JSON lint
+
+# jq over the JSON files of a repository. Catches the class of error a text
+# editor does not flag on its own: a trailing comma, an unresolved template
+# placeholder left where a string is expected, a lone quote - anything that
+# stops the file from parsing at all. It does not check the file's meaning
+# (unknown keys, wrong types for a specific schema); a caller that needs that
+# adds its own step for it.
+#
+# Files are discovered from the git index: every tracked file with a .json
+# extension. Untracked and ignored files are never linted.
+#
+# jq comes from the runner image, so its version is pinned by the runner
+# label rather than by this workflow.
+
+on:
+  workflow_call:
+    inputs:
+      paths:
+        description: "Space-separated files or directories to search for JSON files."
+        required: false
+        type: string
+        default: "."
+      exclude_paths:
+        description: "Space-separated git pathspecs to skip, e.g. 'vendor third_party/*'."
+        required: false
+        type: string
+        default: ""
+      check_format:
+        description: "Also fail on files jq --indent 2 would rewrite (whitespace/key order only, values are untouched)."
+        required: false
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+jobs:
+  json-lint:
+    name: jq
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # No concurrency group here on purpose. It would key on the caller's
+    # workflow name and this workflow's inputs, so a caller that invokes this
+    # workflow twice - two path sets, two suites - lands both calls in one
+    # group and the later one cancels the earlier. That failure is silent:
+    # the cancelled job reports zero steps and no reason.
+    #
+    # Concurrency is therefore the caller's to declare, and this is a real
+    # behavioural dependency rather than a convention: nothing here cancels a
+    # superseded run any more, so a caller that wants one cancelled has to say
+    # so itself, on the calling workflow, where it also knows how many times
+    # it invokes this one.
+    #
+    #   concurrency:
+    #     group: ${{ github.workflow }}-${{ github.ref }}
+    #     cancel-in-progress: ${{ github.ref != 'refs/heads/main' }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Find JSON files
+        id: find
+        shell: bash
+        env:
+          EXCLUDE_PATHS: ${{ inputs.exclude_paths }}
+          PATHS: ${{ inputs.paths }}
+        run: |
+          set -euo pipefail
+
+          read -ra pathspecs <<< "${PATHS}"
+          read -ra excludes <<< "${EXCLUDE_PATHS}"
+          for exclude in "${excludes[@]}"; do
+            pathspecs+=(":(exclude)${exclude}")
+          done
+
+          mapfile -d '' -t candidates < <(git ls-files -z -- "${pathspecs[@]}" '*.json')
+
+          files=()
+          for candidate in "${candidates[@]}"; do
+            [[ -f "${candidate}" ]] || continue # submodule, or a dangling symlink
+            files+=("${candidate}")
+          done
+
+          echo "count=${#files[@]}" >> "${GITHUB_OUTPUT}"
+
+          if [[ "${#files[@]}" -eq 0 ]]; then
+            echo "::warning::No JSON files found under '${PATHS}'"
+            exit 0
+          fi
+
+          printf '%s\0' "${files[@]}" > "${RUNNER_TEMP}/json-files"
+
+          echo "Linting ${#files[@]} file(s):"
+          printf '  %s\n' "${files[@]}"
+
+      - name: Validate JSON syntax
+        if: steps.find.outputs.count != '0'
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          jq --version
+
+          mapfile -d '' -t files < "${RUNNER_TEMP}/json-files"
+
+          fail=0
+          checked=0
+          for file in "${files[@]}"; do
+            if error=$(jq empty -- "${file}" 2>&1); then
+              checked=$((checked + 1))
+              continue
+            fi
+            # jq's own message already carries "line N, column M"; forwarding
+            # it as-is beats re-parsing it just to fill line=/col=.
+            echo "::error file=${file}::${error//$'\n'/ }"
+            fail=1
+          done
+
+          {
+            echo "### JSON syntax"
+            echo ""
+            echo "${checked} of ${#files[@]} file(s) parsed cleanly."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+          exit "${fail}"
+
+      # Whitespace/key-order only: jq --indent normalizes formatting, it never
+      # changes a value. Off by default because most vendored JSON (e.g.
+      # Grafana dashboards exported from the UI) is not jq-formatted, and
+      # reformatting it on every export would just be repo churn.
+      - name: Check formatting
+        if: ${{ !cancelled() && inputs.check_format && steps.find.outputs.count != '0' }}
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          mapfile -d '' -t files < "${RUNNER_TEMP}/json-files"
+
+          fail=0
+          unformatted=()
+          for file in "${files[@]}"; do
+            # A syntax error already failed the previous step; skip it here
+            # rather than report the same file twice for a different reason.
+            jq empty -- "${file}" > /dev/null 2>&1 || continue
+            if ! diff -q <(jq --indent 2 . -- "${file}") "${file}" > /dev/null; then
+              echo "::error file=${file}::not formatted as \`jq --indent 2\` would write it"
+              unformatted+=("${file}")
+              fail=1
+            fi
+          done
+
+          if [[ "${#unformatted[@]}" -gt 0 ]]; then
+            {
+              echo "### JSON formatting"
+              echo ""
+              echo "These files are not \`jq --indent 2\`-formatted:"
+              echo ""
+              printf -- "- \`%s\`\n" "${unformatted[@]}"
+            } >> "${GITHUB_STEP_SUMMARY}"
+          fi
+
+          exit "${fail}"
+...
